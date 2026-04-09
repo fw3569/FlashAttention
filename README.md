@@ -36,3 +36,17 @@ masked native( 乘 + mask + softmax + 乘 )，以后默认都是masked。scaled_
        512           8.9           9.4
       1024          13.6          14.7
 ```
+
+flash attention 特征维度d设置最大64，再多算的是错的，mx450的smem太小
+```
+[benchmark] seq_len=512, head_dim=64
+  custom attention : 0.547 ms
+  pytorch sdpa    : 0.330 ms
+  speedup (sdpa/custom): 1.66x
+
+[memory] peak allocated vs seq_len:
+   seq_len   custom (MB)     sdpa (MB)
+       256           6.3           6.8
+       512           8.9           9.4
+      1024          13.6          14.7
+```

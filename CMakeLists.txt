@@ -4,8 +4,8 @@ set(CMAKE_CUDA_HOST_COMPILER "D:/Program Files/Microsoft Visual Studio/2022/Comm
 set(CMAKE_CXX_COMPILER "D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe")
 set(CMAKE_CUDA_COMPILER "nvcc")
 set(CMAKE_CUDA_ARCHITECTURES 75)
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_COMPILER_FORCED ON)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
 project(Proj LANGUAGES CXX CUDA)
@@ -16,11 +16,13 @@ add_library(
   ./src/csrc/cublas_handle.cu
   ./src/csrc/kernel/attention_kernel.cu
   ./src/csrc/kernel/softmax_kernel.cu
+  ./src/csrc/kernel/flash_attention_kernel.cu
 )
 target_include_directories(
   attention_kernel
   PRIVATE
   ./include
+  "D:/Project/cutlass/include"
 )
 find_package(CUDAToolkit REQUIRED)
 target_link_directories(
@@ -37,6 +39,7 @@ target_link_libraries(
 target_compile_options(
   attention_kernel
   PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler "/permissive- /Zc:lambda /Zc:preprocessor">
   $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANGUAGE:CUDA>>:-O3 --use_fast_math -Xcompiler /W0>
   $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-w -O3 --use_fast_math -Xcompiler "/Zi /W0">
 )

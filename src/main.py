@@ -14,6 +14,17 @@ lib.attention_forward.argtypes = [
     ctypes.c_int,     # head_dim
 ]
 lib.attention_forward.restype = None
+lib.flash_attention_forward.argtypes = [
+    ctypes.c_void_p,  # Q
+    ctypes.c_void_p,  # K
+    ctypes.c_void_p,  # V
+    ctypes.c_void_p,  # O
+    ctypes.c_int,     # batch
+    ctypes.c_int,     # heads
+    ctypes.c_int,     # seq_len
+    ctypes.c_int,     # head_dim
+]
+lib.flash_attention_forward.restype = None
 
 def naive_attention(Q, K, V, scale=None):
     if scale is None:
@@ -29,7 +40,7 @@ def naive_attention(Q, K, V, scale=None):
 def custom_attention(Q, K, V):
     assert Q.is_cuda and Q.is_contiguous()
     O = torch.zeros_like(Q)
-    lib.attention_forward(
+    lib.flash_attention_forward(
         Q.data_ptr(), K.data_ptr(), V.data_ptr(), O.data_ptr(),
         Q.shape[0], Q.shape[1], Q.shape[2], Q.shape[3]
     )
