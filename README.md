@@ -37,12 +37,12 @@ masked native( 乘 + mask + softmax + 乘 )，以后默认都是masked。scaled_
       1024          13.6          14.7
 ```
 
-flash attention 特征维度d设置最大64，再多算的是错的，mx450的smem太小
+flash attention 特征维度d设置最大64，再多算的是错的，mx450的smem太小。hbm读3,281,984，写1,098,208。参考spda的fmha读6,749,152，写1,274,624。
 ```
 [benchmark] seq_len=512, head_dim=64
-  custom attention : 0.547 ms
-  pytorch sdpa    : 0.330 ms
-  speedup (sdpa/custom): 1.66x
+  custom attention : 0.377 ms
+  pytorch sdpa    : 0.334 ms
+  speedup (sdpa/custom): 1.13x
 
 [memory] peak allocated vs seq_len:
    seq_len   custom (MB)     sdpa (MB)

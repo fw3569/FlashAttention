@@ -7,6 +7,7 @@
 #include <cutlass/epilogue/warp/fragment_iterator_simt.h>
 #include <cutlass/epilogue/warp/tile_iterator_simt.h>
 #include <cutlass/gemm/warp/mma_simt.h>
+#include <cutlass/matrix_coord.h>
 #include <nvrtc.h>
 
 #include "flash_attention_kernel.cuh"
@@ -33,7 +34,7 @@ using LayoutO = cutlass::layout::RowMajor;
 
 using WarpShapeQKS = cutlass::gemm::GemmShape<ROW_PER_WARP, BC, STRIDE>;
 using WarpShapeSVO = cutlass::gemm::GemmShape<ROW_PER_WARP, STRIDE, BC>;
-using WarpThreadArrangement = cutlass::MatrixShape<4, 8>;
+using WarpThreadArrangement = cutlass::MatrixShape<2, 16>;
 using ThreadShape = cutlass::gemm::GemmShape<1, 1, 1>;
 using Policy =
     cutlass::gemm::warp::MmaSimtPolicy<WarpThreadArrangement,
@@ -58,13 +59,16 @@ using TileIterSVO = cutlass::epilogue::warp::TileIteratorSimt<
     WarpMmaSVO::Policy>;
 
 template <typename WarpShape, typename Policy>
-struct MmaSimtRowIndex {
-  static CUTLASS_DEVICE int row(unsigned int element_idx,
-                                unsigned int lane_id) {
+struct SimtFragmentCoord {
+  static CUTLASS_DEVICE cutlass::MatrixCoord get_element_coord(
+      unsigned int element_idx, unsigned int lane_id) {
     constexpr unsigned int kElementsPerRow =
         WarpShape::kN / Policy::WarpShape::kColumn;
-    return element_idx / kElementsPerRow * Policy::WarpShape::kRow +
-           lane_id / Policy::WarpShape::kColumn;
+    return cutlass::MatrixCoord{
+        int(element_idx / kElementsPerRow * Policy::WarpShape::kRow +
+            lane_id / Policy::WarpShape::kColumn),
+        int((element_idx & (kElementsPerRow - 1)) * Policy::WarpShape::kColumn +
+            (lane_id & (Policy::WarpShape::kColumn - 1)))};
   }
 };
 }  // namespace
@@ -82,14 +86,19 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
   WarpMmaQKS mma_qks;
   WarpMmaSVO mma_svo;
   WarpMmaSVO::FragmentC frag_o[KGROUPS];
+  CUTLASS_PRAGMA_UNROLL
   for (int i = 0; i < KGROUPS; ++i) {
     frag_o[i].clear();
   }
-  float reg_m = -INFINITY;
-  float reg_new_m;
-  float reg_new_l;
-  float reg_expdiffm = 1;
-  float reg_l = 0;
+  constexpr unsigned int row_per_lane = ROW_PER_WARP / Policy::WarpShape::kRow;
+  float reg_m[row_per_lane];
+  float reg_expdiffm[row_per_lane];
+  float reg_l[row_per_lane];
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < row_per_lane; ++i) {
+    reg_m[i] = -INFINITY;
+    reg_l[i] = 0;
+  }
   float inv_sqrt_head_dim = rsqrtf((float)head_dim);
 
   // load q
@@ -149,7 +158,63 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
       __syncthreads();
     }
     frag_s = frag_s * inv_sqrt_head_dim;
-    // don't store it to smem ?
+    if (is_causal) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < WarpMmaQKS::FragmentC::kElements; ++i) {
+        auto coord = SimtFragmentCoord<WarpShapeQKS, Policy>::get_element_coord(
+            i, threadIdx.x);
+        if (tilecol + coord.column() >
+            tilerow + threadIdx.y * ROW_PER_WARP + coord.row()) {
+          frag_s[i] = 0;
+        }
+      }
+    }
+
+    // softmax
+    {
+      int thread_row = threadIdx.x / Policy::WarpShape::kColumn;
+      int thread_col = threadIdx.x & (Policy::WarpShape::kColumn - 1);
+      constexpr int row_size = WarpShapeQKS::kM / Policy::WarpShape::kRow;
+      constexpr int col_size = WarpShapeQKS::kN / Policy::WarpShape::kColumn;
+      for (int row = 0; row < row_size; ++row) {
+        float new_m = reg_m[row];
+        CUTLASS_PRAGMA_UNROLL
+        for (int col = 0;
+             col < col_size &&
+             (!is_causal ||
+              tilerow + threadIdx.y * ROW_PER_WARP +
+                      row * Policy::WarpShape::kRow + thread_row >=
+                  tilecol + col * Policy::WarpShape::kColumn + thread_col);
+             ++col) {
+          new_m = max(new_m, frag_s[row * col_size + col]);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = Policy::WarpShape::kColumn >> 1; i >= 1; i >>= 1) {
+          new_m = max(new_m, __shfl_xor_sync(0xffffffff, new_m, i));
+        }
+        float new_l = 0;
+        CUTLASS_PRAGMA_UNROLL
+        for (int col = 0;
+             col < col_size &&
+             (!is_causal ||
+              tilerow + threadIdx.y * ROW_PER_WARP +
+                      row * Policy::WarpShape::kRow + thread_row >=
+                  tilecol + col * Policy::WarpShape::kColumn + thread_col);
+             ++col) {
+          float temp_s = expf(frag_s[row * col_size + col] - new_m);
+          frag_s[row * col_size + col] = temp_s;
+          new_l += temp_s;
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = Policy::WarpShape::kColumn >> 1; i >= 1; i >>= 1) {
+          new_l += __shfl_xor_sync(0xffffffff, new_l, i);
+        }
+        // WarpShape::kM/Policy::WarpShape::kRow<=Policy::WarpShape::kColumn
+        reg_expdiffm[row] = expf(reg_m[row] - new_m);
+        reg_m[row] = new_m;
+        reg_l[row] = reg_l[row] * reg_expdiffm[row] + new_l;
+      }
+    }
     {
       FragIterQKS frag_iter(frag_s);
       TileIterQKS::TensorRef ref_s(s_br_bc[threadIdx.y * ROW_PER_WARP],
@@ -164,57 +229,19 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
         tile_iter.add_tile_offset({1, 0});
       }
     }
-    if (is_causal) {
-      for (int i = threadIdx.x; i < ROW_PER_WARP * BC; i += 32) {
-        int col = i & (BC - 1);
-        int row = i / BC + threadIdx.y * ROW_PER_WARP;
-        if (tilerow + row < tilecol + col) {
-          s_br_bc[row][col] = 0;
+
+    // find row of fragment c and rescale exp
+    {
+      constexpr unsigned int col_size = STRIDE / Policy::WarpShape::kColumn;
+      CUTLASS_PRAGMA_UNROLL
+      for (int k = 0; k < KGROUPS; ++k) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < WarpMmaSVO::FragmentC::kElements / col_size; ++i) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < col_size; ++j) {
+            frag_o[k][i * col_size + j] *= reg_expdiffm[i];
+          }
         }
-      }
-    }
-
-    // softmax
-    for (int row_in_smem = threadIdx.y * ROW_PER_WARP, row = 0;
-         row < ROW_PER_WARP && tilerow + row_in_smem < seq_len;
-         ++row, ++row_in_smem) {
-      float new_m = __shfl_sync(0xffffffff, reg_m, row);
-      for (int col = threadIdx.x;
-           col < BC && tilecol + col < seq_len &&
-           (!is_causal || tilerow + row_in_smem >= tilecol + col);
-           col += 32) {
-        new_m = max(new_m, s_br_bc[row_in_smem][col]);
-      }
-      for (int i = 16; i >= 1; i >>= 1) {
-        new_m = max(new_m, __shfl_xor_sync(0xffffffff, new_m, i));
-      }
-      float new_l = 0.f;
-      for (int col = threadIdx.x;
-           col < BC && tilecol + col < seq_len &&
-           (!is_causal || tilerow + row_in_smem >= tilecol + col);
-           col += 32) {
-        float temp_s = expf(s_br_bc[row_in_smem][col] - new_m);
-        s_br_bc[row_in_smem][col] = temp_s;
-        new_l += temp_s;
-      }
-      for (int i = 16; i >= 1; i >>= 1) {
-        new_l += __shfl_xor_sync(0xffffffff, new_l, i);
-      }
-      if (row == threadIdx.x) {
-        reg_new_m = new_m;
-        reg_new_l = new_l;
-      }
-    }
-    reg_expdiffm = expf(reg_m - reg_new_m);
-    reg_m = reg_new_m;
-    reg_l = reg_l * reg_expdiffm + reg_new_l;
-
-    // find row of fragment c and rescale
-    for (int k = 0; k < KGROUPS; ++k) {
-      for (int i = 0; i < WarpMmaSVO::FragmentC::kElements; ++i) {
-        frag_o[k][i] *= __shfl_sync(
-            0xffffffff, reg_expdiffm,
-            MmaSimtRowIndex<WarpShapeSVO, Policy>::row(i, threadIdx.x));
       }
     }
 
@@ -255,13 +282,22 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
     }
   }
 
-  // find row of fragment c and rescale
-  reg_l = 1.f / reg_l;
-  for (int k = 0; k < KGROUPS; ++k) {
-    for (int i = 0; i < WarpMmaSVO::FragmentC::kElements; ++i) {
-      frag_o[k][i] *= __shfl_sync(
-          0xffffffff, reg_l,
-          MmaSimtRowIndex<WarpShapeSVO, Policy>::row(i, threadIdx.x));
+  // find row of fragment c and rescale l
+  {
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < row_per_lane; ++i) {
+      reg_l[i] = 1.f / reg_l[i];
+    }
+    constexpr unsigned int col_size = STRIDE / Policy::WarpShape::kColumn;
+    CUTLASS_PRAGMA_UNROLL
+    for (int k = 0; k < KGROUPS; ++k) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < WarpMmaSVO::FragmentC::kElements / col_size; ++i) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < col_size; ++j) {
+          frag_o[k][i * col_size + j] *= reg_l[i];
+        }
+      }
     }
   }
 
@@ -302,6 +338,6 @@ void flash_attention_forward(float* Q, float* K, float* V, float* O, int batch,
                              int heads, int seq_len, int head_dim) {
   dim3 block(32, WARP_PER_BLOCK);
   dim3 grid(1, (seq_len + BR - 1) / BR, batch * heads);
-  flash_attention_kernel<<<grid, block>>>(Q, K, V, O, seq_len, head_dim);
+  flash_attention_kernel<<<grid, block>>>(Q, K, V, O, seq_len, head_dim, true);
 }
 }
