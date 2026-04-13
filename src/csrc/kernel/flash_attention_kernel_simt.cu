@@ -10,7 +10,7 @@
 #include <cutlass/matrix_coord.h>
 #include <nvrtc.h>
 
-#include "flash_attention_kernel.cuh"
+#include "flash_attention_kernel_simt.cuh"
 
 #define WARP_PER_BLOCK 4
 #define ROW_PER_WARP 8
@@ -334,8 +334,9 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
 }
 
 extern "C" {
-void flash_attention_forward(float* Q, float* K, float* V, float* O, int batch,
-                             int heads, int seq_len, int head_dim) {
+void flash_attention_simt_forward(float* Q, float* K, float* V, float* O,
+                                  int batch, int heads, int seq_len,
+                                  int head_dim) {
   dim3 block(32, WARP_PER_BLOCK);
   dim3 grid(1, (seq_len + BR - 1) / BR, batch * heads);
   flash_attention_kernel<<<grid, block>>>(Q, K, V, O, seq_len, head_dim, true);

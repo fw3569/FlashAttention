@@ -1,5 +1,5 @@
 # WIP
-flash attention，开发中
+flash attention，使用cutlass 4.4.2，开发中
 
 下面内容不保证最新
 
@@ -49,4 +49,18 @@ flash attention 特征维度d设置最大64，再多算的是错的，mx450的sm
        256           6.3           6.8
        512           8.9           9.4
       1024          13.6          14.7
+```
+
+flash attention fp16 速度基本在spda的115%到120%，但是spda的性能有波动，可能会偶发特别快一下。性能不如fp32大概是因为v矩阵需要转置一下。hbm读1,607,872，写623,648。参考spda的fmha读2,914,272，写674,336。
+```
+[benchmark] seq_len=512, head_dim=64
+  custom attention : 0.751 ms
+  pytorch sdpa    : 0.887 ms
+  speedup (sdpa/custom): 0.85x
+
+[memory] peak allocated vs seq_len:
+   seq_len   custom (MB)     sdpa (MB)
+       256           3.1           3.4
+       512           4.5           4.7
+      1024           6.8           7.3
 ```

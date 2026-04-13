@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import ctypes
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
 lib = ctypes.CDLL("../build/Debug/attention_kernel.dll")
 lib.attention_forward.argtypes = [
@@ -14,7 +15,7 @@ lib.attention_forward.argtypes = [
     ctypes.c_int,     # head_dim
 ]
 lib.attention_forward.restype = None
-lib.flash_attention_forward.argtypes = [
+lib.flash_attention_simt_forward.argtypes = [
     ctypes.c_void_p,  # Q
     ctypes.c_void_p,  # K
     ctypes.c_void_p,  # V
@@ -24,7 +25,18 @@ lib.flash_attention_forward.argtypes = [
     ctypes.c_int,     # seq_len
     ctypes.c_int,     # head_dim
 ]
-lib.flash_attention_forward.restype = None
+lib.flash_attention_simt_forward.restype = None
+lib.flash_attention_tensor_op_forward.argtypes = [
+    ctypes.c_void_p,  # Q
+    ctypes.c_void_p,  # K
+    ctypes.c_void_p,  # V
+    ctypes.c_void_p,  # O
+    ctypes.c_int,     # batch
+    ctypes.c_int,     # heads
+    ctypes.c_int,     # seq_len
+    ctypes.c_int,     # head_dim
+]
+lib.flash_attention_tensor_op_forward.restype = None
 
 def naive_attention(Q, K, V, scale=None):
     if scale is None:
@@ -40,7 +52,7 @@ def naive_attention(Q, K, V, scale=None):
 def custom_attention(Q, K, V):
     assert Q.is_cuda and Q.is_contiguous()
     O = torch.zeros_like(Q)
-    lib.flash_attention_forward(
+    lib.flash_attention_tensor_op_forward(
         Q.data_ptr(), K.data_ptr(), V.data_ptr(), O.data_ptr(),
         Q.shape[0], Q.shape[1], Q.shape[2], Q.shape[3]
     )
@@ -52,16 +64,16 @@ def pytorch_sdpa(Q, K, V, scale=None):
 
 def run_correctness_check(batch=2, heads=4, seq_len=512, head_dim=64, device="cuda"):
     torch.manual_seed(42)
-    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.float32)
-    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.float32)
-    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.float32)
+    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
+    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
+    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
 
     ref = pytorch_sdpa(Q, K, V)
     out = custom_attention(Q, K, V)
 
-    max_diff = (ref - out).abs().max().item()
+    max_diff = (ref - out).abs().max().item() * (ref.abs().max().item() * out.abs().max().item() + 1e-6)**-0.5
     print(f"[correctness] custom vs sdpa: max_diff = {max_diff:.2e}")
-    assert max_diff < 1e-4, f"correctness check failed: {max_diff}"
+    assert max_diff < 1e-3, f"correctness check failed: {max_diff}"
     print("[correctness] PASSED")
     return Q, K, V, ref
 
@@ -102,9 +114,9 @@ def run_memory_check(batch=2, heads=4, head_dim=64, device="cuda"):
 
     for seq_len in [256, 512, 1024]:
         torch.manual_seed(0)
-        Q = torch.randn(batch, heads, seq_len, head_dim, device=device)
-        K = torch.randn(batch, heads, seq_len, head_dim, device=device)
-        V = torch.randn(batch, heads, seq_len, head_dim, device=device)
+        Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
+        K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
+        V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
 
         torch.cuda.reset_peak_memory_stats()
         _ = custom_attention(Q, K, V)

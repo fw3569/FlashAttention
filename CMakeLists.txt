@@ -16,7 +16,8 @@ add_library(
   ./src/csrc/cublas_handle.cu
   ./src/csrc/kernel/attention_kernel.cu
   ./src/csrc/kernel/softmax_kernel.cu
-  ./src/csrc/kernel/flash_attention_kernel.cu
+  ./src/csrc/kernel/flash_attention_kernel_simt.cu
+  ./src/csrc/kernel/flash_attention_kernel_tensor_op.cu
 )
 target_include_directories(
   attention_kernel
@@ -39,9 +40,9 @@ target_link_libraries(
 target_compile_options(
   attention_kernel
   PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler "/permissive- /Zc:lambda /Zc:preprocessor">
-  $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANGUAGE:CUDA>>:-O3 --use_fast_math -Xcompiler /W0>
-  $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-w -O3 --use_fast_math -Xcompiler "/Zi /W0">
+  $<$<COMPILE_LANGUAGE:CUDA>: -Xcompiler=/permissive- -Xcompiler=/Zc:lambda -Xcompiler=/Zc:preprocessor>
+  $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANGUAGE:CUDA>>: -O3 --use_fast_math -Xcompiler=/W0>
+  $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>: -w -O3 --use_fast_math -Xcompiler="/W0">
 )
 target_link_options(
   attention_kernel

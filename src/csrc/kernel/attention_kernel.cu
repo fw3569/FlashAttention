@@ -3,7 +3,6 @@
 #include <device_launch_parameters.h>
 
 #include "cublas_handle.cuh"
-#include "flash_attention_kernel.cuh"
 #include "softmax_kernel.cuh"
 #include "utils.cuh"
 
