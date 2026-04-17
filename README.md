@@ -1,66 +1,80 @@
-# WIP
-flash attention，使用cutlass 4.4.2，开发中
+## Flash Attention CUDA Implementation
+基于 CUTLASS 的 Flash Attention 自定义 CUDA 实现，使用 PyTorch 通过 ctypes 调用。
 
-下面内容不保证最新
+#### 环境
+- **CUTLASS**: 4.4.2
+- **torch**: 2.6.0+cu124
+- **CUDA Architecture**: sm_75（RTX mx450/Turing）
+
+#### 构建前配置
+硬编码了一些路径，使用前需根据本机环境修改
+
+**./CMakeLists.txt**
+
+- `CMAKE_CUDA_HOST_COMPILER` — MSVC cl.exe 路径
+- `CMAKE_CXX_COMPILER` — 同上
+- `CMAKE_CUDA_COMPILER` — CUDA nvcc 路径
+- `CMAKE_CUDA_ARCHITECTURES` — 目标 GPU 架构（sm_75 = Turing，其他卡需改）
+- `target_include_directories` — cutlass include 路径
+
+**./src/main.py**
+
+- `ctypes.CDLL` — 动态库DLL 路径，取决于构建类型和系统
 
 #### 构建
-
-cmake构建dll后运行`python main.py`
-
-#### 测试数据
-native( 乘 + softmax + 乘 )。hbm读27,610,272，写17,635,328。
-```
-[benchmark] seq_len=512, head_dim=64
-  custom attention : 0.836 ms
-  pytorch sdpa    : 0.492 ms
-  speedup (sdpa/custom): 1.70x
-
-[memory] peak allocated vs seq_len:
-   seq_len   custom (MB)     sdpa (MB)
-       256           6.3           6.8
-       512           8.9           9.4
-      1024          13.6          14.7
-      2048          23.1          25.2
+Windows + MSVC 环境下
+``` bash
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build .
 ```
 
-masked native( 乘 + mask + softmax + 乘 )，以后默认都是masked。scaled_dot_product_attention在序列长度超过1024会挂掉，删了2048的测试。hbm读27,612,928，写21,795,296。
-```
-[benchmark] seq_len=512, head_dim=64
-  custom attention : 0.887 ms
-  pytorch sdpa    : 0.328 ms
-  speedup (sdpa/custom): 2.70x
-
-[memory] peak allocated vs seq_len:
-   seq_len   custom (MB)     sdpa (MB)
-       256           6.3           6.8
-       512           8.9           9.4
-      1024          13.6          14.7
+构建完成后运行：
+``` bash
+python main.py
 ```
 
-flash attention 特征维度d设置最大64，再多算的是错的，mx450的smem太小。hbm读3,281,984，写1,098,208。参考spda的fmha读6,749,152，写1,274,624。
-```
-[benchmark] seq_len=512, head_dim=64
-  custom attention : 0.377 ms
-  pytorch sdpa    : 0.334 ms
-  speedup (sdpa/custom): 1.13x
+#### 实现说明
+提供三个 attention 变体：
 
-[memory] peak allocated vs seq_len:
-   seq_len   custom (MB)     sdpa (MB)
-       256           6.3           6.8
-       512           8.9           9.4
-      1024          13.6          14.7
-```
+`attention_forward` — Native attention（矩阵乘 + softmax + 矩阵乘），基线实现。
 
-flash attention fp16 速度基本在spda的115%到120%，但是spda的性能有波动，可能会偶发特别快一下。性能不如fp32大概是因为v矩阵需要转置一下。hbm读1,607,872，写623,648。参考spda的fmha读2,914,272，写674,336。
-```
-[benchmark] seq_len=512, head_dim=64
-  custom attention : 0.751 ms
-  pytorch sdpa    : 0.887 ms
-  speedup (sdpa/custom): 0.85x
+`flash_attention_simt_forward` — Flash Attention FP32，使用 CUTLASS SIMT warp MMA。
 
-[memory] peak allocated vs seq_len:
-   seq_len   custom (MB)     sdpa (MB)
-       256           3.1           3.4
-       512           4.5           4.7
-      1024           6.8           7.3
-```
+`flash_attention_tensor_op_forward` — Flash Attention FP16，使用 CUTLASS Tensor Core MMA。
+
+#### 性能测试
+**测试参数**：固定为`batch=2, heads=4, seq_len=512, head_dim=64`  
+**测试方法**：耗时是在python打点`time.perf_counter`测试，10次warmup，100次运行取平均值。HBM读写量是使用ncu检查`dram__bytes_read.sum dram__bytes_write.sum`。
+
+**Native Attention（FP32）**  
+HBM 读 27.6M / 写 21.8M bytes
+|实现|耗时|
+|--|--|
+|custom|0.887ms|
+|pytorch sdpa|0.328 ms|
+|加速比|0.37x|
+
+**Flash Attention SIMT（FP32）**  
+HBM 读 3.3M / 写 1.1M bytes，相比 sdpa 的 6.7M / 1.3M 有显著改善
+|实现|耗时|
+|--|--|
+|custom|0.377 ms|
+|pytorch sdpa|0.334 ms|
+|加速比|0.89x|
+
+**Flash Attention Tensor Op（FP16）**  
+HBM 读 1.6M / 写 0.6M bytes，相比 sdpa 的 2.9M / 0.7M 进一步减少
+|实现|耗时|
+|--|--|
+|custom|0.751 ms|
+|pytorch sdpa|0.887 ms|
+|加速比|1.18x|
+
+FP16 版本相对 FP32 版本偏慢，原因推测是 V 矩阵需要额外转置（CUTLASS Tensor Core 要求 ColumnMajor B）。  
+FP16 版本相对 FP32 版本加速比更高，推测是因为开发顺序靠后，有更多更仔细的修改和调参。
+
+#### 其他
+- head_dim 最大支持 64（SIMT/FP32）,如果要128版本需要重新调参数
+- 没有做双缓冲是因为mx450实际不支持异步拷贝
+- 考虑后续加上双缓冲版本并找个云端8.0+架构测试
