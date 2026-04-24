@@ -12,7 +12,7 @@
 #include <cutlass/gemm/warp/mma_tensor_op.h>
 #include <nvrtc.h>
 
-#include "flash_attention_kernel_tensor_op.cuh"
+#include "flash_attention_tensor_op_kernel.cuh"
 
 #define WARP_PER_BLOCK 1
 #define ROW_PER_WARP 16
@@ -365,13 +365,30 @@ __global__ void flash_attention_kernel(cutlass::half_t* Q, cutlass::half_t* K,
   }
 }
 
-extern "C" {
-void flash_attention_tensor_op_forward(cutlass::half_t* Q, cutlass::half_t* K,
-                                       cutlass::half_t* V, cutlass::half_t* O,
-                                       int batch, int heads, int seq_len,
-                                       int head_dim) {
+torch::Tensor flash_attention_tensor_op_forward(torch::Tensor Q,
+                                                torch::Tensor K,
+                                                torch::Tensor V) {
+  TORCH_CHECK(Q.is_cuda(), "Q must be CUDA tensor");
+  TORCH_CHECK(K.is_cuda(), "K must be CUDA tensor");
+  TORCH_CHECK(V.is_cuda(), "V must be CUDA tensor");
+  TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous");
+  TORCH_CHECK(K.is_contiguous(), "K must be contiguous");
+  TORCH_CHECK(V.is_contiguous(), "V must be contiguous");
+
+  int batch = Q.size(0);
+  int heads = Q.size(1);
+  int seq_len = Q.size(2);
+  int head_dim = Q.size(3);
+
+  auto O = torch::zeros({batch, heads, seq_len, head_dim}, Q.options());
+
   dim3 block(32, WARP_PER_BLOCK);
   dim3 grid(1, (seq_len + BR - 1) / BR, batch * heads);
-  flash_attention_kernel<<<grid, block>>>(Q, K, V, O, seq_len, head_dim, true);
-}
+  flash_attention_kernel<<<grid, block>>>(
+      static_cast<cutlass::half_t*>(Q.data_ptr()),
+      static_cast<cutlass::half_t*>(K.data_ptr()),
+      static_cast<cutlass::half_t*>(V.data_ptr()),
+      static_cast<cutlass::half_t*>(O.data_ptr()), seq_len, head_dim, true);
+
+  return O;
 }

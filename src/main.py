@@ -1,42 +1,37 @@
+import os
 import torch
 import torch.nn.functional as F
-import ctypes
+from torch.utils.cpp_extension import load
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+major, minor = torch.cuda.get_device_capability()
+arch_version = f"{major}.{minor}"
+os.environ['TORCH_CUDA_ARCH_LIST'] = arch_version
+cutlass_path = "D:/Project/cutlass/include"
+build_dir = os.path.join("./", "build")
+os.makedirs(build_dir, exist_ok=True)
 
-lib = ctypes.CDLL("../build/Debug/attention_kernel.dll")
-lib.attention_forward.argtypes = [
-    ctypes.c_void_p,  # Q
-    ctypes.c_void_p,  # K
-    ctypes.c_void_p,  # V
-    ctypes.c_void_p,  # O
-    ctypes.c_int,     # batch
-    ctypes.c_int,     # heads
-    ctypes.c_int,     # seq_len
-    ctypes.c_int,     # head_dim
-]
-lib.attention_forward.restype = None
-lib.flash_attention_simt_forward.argtypes = [
-    ctypes.c_void_p,  # Q
-    ctypes.c_void_p,  # K
-    ctypes.c_void_p,  # V
-    ctypes.c_void_p,  # O
-    ctypes.c_int,     # batch
-    ctypes.c_int,     # heads
-    ctypes.c_int,     # seq_len
-    ctypes.c_int,     # head_dim
-]
-lib.flash_attention_simt_forward.restype = None
-lib.flash_attention_tensor_op_forward.argtypes = [
-    ctypes.c_void_p,  # Q
-    ctypes.c_void_p,  # K
-    ctypes.c_void_p,  # V
-    ctypes.c_void_p,  # O
-    ctypes.c_int,     # batch
-    ctypes.c_int,     # heads
-    ctypes.c_int,     # seq_len
-    ctypes.c_int,     # head_dim
-]
-lib.flash_attention_tensor_op_forward.restype = None
+custom_attention_extension = load(
+    name="attention_extension",
+    sources=["./csrc/src/kernel/attention_binding.cpp", "./csrc/src/cublas_handle.cu", "./csrc/src/kernel/attention_kernel.cu", "./csrc/src/kernel/softmax_kernel.cu"],
+    extra_ldflags=["cublas.lib"],
+    extra_include_paths = ["./csrc/include"],
+    build_directory=build_dir,
+    verbose=False
+)
+custom_flash_attention_simt_extension = load(
+    name="flash_attention_simt_extension",
+    sources=["./csrc/src/kernel/flash_attention_simt_binding.cpp", "./csrc/src/kernel/flash_attention_simt_kernel.cu"],
+    extra_include_paths = ["./csrc/include", cutlass_path],
+    build_directory=build_dir,
+    verbose=False
+)
+custom_flash_attention_tensor_op_extension = load(
+    name="flash_attention_tensor_op_extension",
+    sources=["./csrc/src/kernel/flash_attention_tensor_op_binding.cpp", "./csrc/src/kernel/flash_attention_tensor_op_kernel.cu"],
+    extra_include_paths = ["./csrc/include", cutlass_path],
+    build_directory=build_dir,
+    verbose=False
+)
 
 def naive_attention(Q, K, V, scale=None):
     if scale is None:
@@ -50,13 +45,7 @@ def naive_attention(Q, K, V, scale=None):
     return out
 
 def custom_attention(Q, K, V):
-    assert Q.is_cuda and Q.is_contiguous()
-    O = torch.zeros_like(Q)
-    lib.flash_attention_tensor_op_forward(
-        Q.data_ptr(), K.data_ptr(), V.data_ptr(), O.data_ptr(),
-        Q.shape[0], Q.shape[1], Q.shape[2], Q.shape[3]
-    )
-    return O
+    return custom_flash_attention_tensor_op_extension.forward(Q, K, V)
 
 def pytorch_sdpa(Q, K, V, scale=None):
     return F.scaled_dot_product_attention(Q, K, V, is_causal=True, scale=scale)

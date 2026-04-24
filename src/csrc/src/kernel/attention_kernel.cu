@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
+#include "attention_kernel.cuh"
 #include "cublas_handle.cuh"
 #include "softmax_kernel.cuh"
 #include "utils.cuh"
@@ -22,9 +23,22 @@ int cur_score_size = 0;
 
 #define MAX_THREADS_PER_BLOCK 1024
 
-extern "C" {
-void attention_forward(float* Q, float* K, float* V, float* O, int batch,
-                       int heads, int seq_len, int head_dim) {
+torch::Tensor attention_forward(torch::Tensor Q, torch::Tensor K,
+                                torch::Tensor V) {
+  TORCH_CHECK(Q.is_cuda(), "Q must be CUDA tensor");
+  TORCH_CHECK(K.is_cuda(), "K must be CUDA tensor");
+  TORCH_CHECK(V.is_cuda(), "V must be CUDA tensor");
+  TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous");
+  TORCH_CHECK(K.is_contiguous(), "K must be contiguous");
+  TORCH_CHECK(V.is_contiguous(), "V must be contiguous");
+
+  int batch = Q.size(0);
+  int heads = Q.size(1);
+  int seq_len = Q.size(2);
+  int head_dim = Q.size(3);
+
+  auto O = torch::zeros({batch, heads, seq_len, head_dim}, Q.options());
+
   size_t required_score_size =
       batch * heads * seq_len * seq_len * sizeof(float);
   if (score == nullptr || required_score_size > cur_score_size) {
@@ -42,12 +56,12 @@ void attention_forward(float* Q, float* K, float* V, float* O, int batch,
   float alpha = 1.0f;
   float beta = 0.0f;
   float inv_sqrt_head_dim = sqrt(1.0f / head_dim);
-  cublasGemmStridedBatchedEx(get_cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                             seq_len, seq_len, head_dim, &inv_sqrt_head_dim, K,
-                             CUDA_R_32F, head_dim, seq_len * head_dim, Q,
-                             CUDA_R_32F, head_dim, seq_len * head_dim, &beta,
-                             score, CUDA_R_32F, seq_len, seq_len * seq_len,
-                             batch * heads, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+  cublasGemmStridedBatchedEx(
+      get_cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, seq_len, seq_len, head_dim,
+      &inv_sqrt_head_dim, K.data_ptr(), CUDA_R_32F, head_dim,
+      seq_len * head_dim, Q.data_ptr(), CUDA_R_32F, head_dim,
+      seq_len * head_dim, &beta, score, CUDA_R_32F, seq_len, seq_len * seq_len,
+      batch * heads, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
   if (seq_len <= MAX_THREADS_PER_BLOCK) {
     apply_causal_mask<<<dim3(1, seq_len, batch * heads), seq_len>>>(
         score, seq_len, seq_len * seq_len);
@@ -61,8 +75,9 @@ void attention_forward(float* Q, float* K, float* V, float* O, int batch,
   softmax(score, score, seq_len * batch * heads, seq_len);
   cublasGemmStridedBatchedEx(
       get_cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N, head_dim, seq_len, seq_len,
-      &alpha, V, CUDA_R_32F, head_dim, seq_len * head_dim, score, CUDA_R_32F,
-      seq_len, seq_len * seq_len, &beta, O, CUDA_R_32F, head_dim,
-      seq_len * head_dim, batch * heads, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-}
+      &alpha, V.data_ptr(), CUDA_R_32F, head_dim, seq_len * head_dim, score,
+      CUDA_R_32F, seq_len, seq_len * seq_len, &beta, O.data_ptr(), CUDA_R_32F,
+      head_dim, seq_len * head_dim, batch * heads, CUDA_R_32F,
+      CUBLAS_GEMM_DEFAULT);
+  return O;
 }

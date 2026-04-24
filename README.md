@@ -2,6 +2,7 @@
 基于 CUTLASS 的 Flash Attention 自定义 CUDA 实现，使用 PyTorch 通过 ctypes 调用。
 
 #### 环境
+- **CUDA**: 12.4
 - **CUTLASS**: 4.4.2
 - **torch**: 2.6.0+cu124
 - **CUDA Architecture**: sm_75（RTX mx450/Turing）
@@ -9,27 +10,13 @@
 #### 构建前配置
 硬编码了一些路径，使用前需根据本机环境修改
 
-**./CMakeLists.txt**
-
-- `CMAKE_CUDA_HOST_COMPILER` — MSVC cl.exe 路径
-- `CMAKE_CXX_COMPILER` — 同上
-- `CMAKE_CUDA_COMPILER` — CUDA nvcc 路径
-- `CMAKE_CUDA_ARCHITECTURES` — 目标 GPU 架构（sm_75 = Turing，其他卡需改）
-- `target_include_directories` — cutlass include 路径
-
 **./src/main.py**
 
-- `ctypes.CDLL` — 动态库DLL 路径，取决于构建类型和系统
+- `cutlass_path` — cutlass include路径
 
-#### 构建
+#### 构建和运行
 Windows + MSVC 环境下
-``` bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build .
-```
 
-构建完成后运行：
 ``` bash
 python main.py
 ```

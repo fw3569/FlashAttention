@@ -10,7 +10,7 @@
 #include <cutlass/matrix_coord.h>
 #include <nvrtc.h>
 
-#include "flash_attention_kernel_simt.cuh"
+#include "flash_attention_simt_kernel.cuh"
 
 #define WARP_PER_BLOCK 4
 #define ROW_PER_WARP 8
@@ -333,12 +333,27 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
   }
 }
 
-extern "C" {
-void flash_attention_simt_forward(float* Q, float* K, float* V, float* O,
-                                  int batch, int heads, int seq_len,
-                                  int head_dim) {
+torch::Tensor flash_attention_simt_forward(torch::Tensor Q, torch::Tensor K,
+                                           torch::Tensor V) {
+  TORCH_CHECK(Q.is_cuda(), "Q must be CUDA tensor");
+  TORCH_CHECK(K.is_cuda(), "K must be CUDA tensor");
+  TORCH_CHECK(V.is_cuda(), "V must be CUDA tensor");
+  TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous");
+  TORCH_CHECK(K.is_contiguous(), "K must be contiguous");
+  TORCH_CHECK(V.is_contiguous(), "V must be contiguous");
+
+  int batch = Q.size(0);
+  int heads = Q.size(1);
+  int seq_len = Q.size(2);
+  int head_dim = Q.size(3);
+
+  auto O = torch::zeros({batch, heads, seq_len, head_dim}, Q.options());
+
   dim3 block(32, WARP_PER_BLOCK);
   dim3 grid(1, (seq_len + BR - 1) / BR, batch * heads);
-  flash_attention_kernel<<<grid, block>>>(Q, K, V, O, seq_len, head_dim, true);
-}
+  flash_attention_kernel<<<grid, block>>>(
+      Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
+      O.data_ptr<float>(), seq_len, head_dim, true);
+
+  return O;
 }
