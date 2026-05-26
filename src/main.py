@@ -47,8 +47,27 @@ def naive_attention(Q, K, V, scale=None):
 def custom_attention(Q, K, V):
     return custom_flash_attention_tensor_op_extension.forward(Q, K, V)
 
+#unsupport in sm75
+def pytorch_sdpa_flash(Q, K, V, scale=None):
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+        return F.scaled_dot_product_attention(Q, K, V, is_causal=True, scale=scale)
+
+def pytorch_sdpa_math(Q, K, V, scale=None):
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        return F.scaled_dot_product_attention(Q, K, V, is_causal=True, scale=scale)
+
+#default and fastest backend in mx450
+def pytorch_sdpa_mem_efficient(Q, K, V, scale=None):
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
+        return F.scaled_dot_product_attention(Q, K, V, is_causal=True, scale=scale)
+
+#unsupport in sm75
+def pytorch_sdpa_cudnn(Q, K, V, scale=None):
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.CUDNN_ATTENTION):
+        return F.scaled_dot_product_attention(Q, K, V, is_causal=True, scale=scale)
+
 def pytorch_sdpa(Q, K, V, scale=None):
-    return F.scaled_dot_product_attention(Q, K, V, is_causal=True, scale=scale)
+    return pytorch_sdpa_mem_efficient(Q, K, V, scale)
 
 
 def run_correctness_check(batch=2, heads=4, seq_len=512, head_dim=64, device="cuda"):
@@ -67,14 +86,13 @@ def run_correctness_check(batch=2, heads=4, seq_len=512, head_dim=64, device="cu
     return Q, K, V, ref
 
 
-def run_benchmark(Q, K, V, warmup=10, iters=100):
+def run_benchmark(Q, K, V, warmup=20, iters=100):
     import time
 
     device = Q.device
 
     for _ in range(warmup):
         _ = custom_attention(Q, K, V)
-        _ = pytorch_sdpa(Q, K, V)
     torch.cuda.synchronize()
 
     start = time.perf_counter()
@@ -82,6 +100,10 @@ def run_benchmark(Q, K, V, warmup=10, iters=100):
         _ = custom_attention(Q, K, V)
     torch.cuda.synchronize()
     custom_ms = (time.perf_counter() - start) / iters * 1000
+
+    for _ in range(warmup):
+        _ = pytorch_sdpa(Q, K, V)
+    torch.cuda.synchronize()
 
     start = time.perf_counter()
     for _ in range(iters):
