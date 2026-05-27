@@ -1,37 +1,15 @@
 import os
+import sys
+import time
+import math
 import torch
 import torch.nn.functional as F
-from torch.utils.cpp_extension import load
+sys.path.insert(0, "./build")
+import attention_extension
+import flash_attention_simt_extension
+import flash_attention_tensor_op_extension
+# force fp32 accum
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-major, minor = torch.cuda.get_device_capability()
-arch_version = f"{major}.{minor}"
-os.environ['TORCH_CUDA_ARCH_LIST'] = arch_version
-cutlass_path = "D:/Project/cutlass/include"
-build_dir = os.path.join("./", "build")
-os.makedirs(build_dir, exist_ok=True)
-
-custom_attention_extension = load(
-    name="attention_extension",
-    sources=["./csrc/src/kernel/attention_binding.cpp", "./csrc/src/cublas_handle.cu", "./csrc/src/kernel/attention_kernel.cu", "./csrc/src/kernel/softmax_kernel.cu"],
-    extra_ldflags=["cublas.lib"],
-    extra_include_paths = ["./csrc/include"],
-    build_directory=build_dir,
-    verbose=False
-)
-custom_flash_attention_simt_extension = load(
-    name="flash_attention_simt_extension",
-    sources=["./csrc/src/kernel/flash_attention_simt_binding.cpp", "./csrc/src/kernel/flash_attention_simt_kernel.cu"],
-    extra_include_paths = ["./csrc/include", cutlass_path],
-    build_directory=build_dir,
-    verbose=False
-)
-custom_flash_attention_tensor_op_extension = load(
-    name="flash_attention_tensor_op_extension",
-    sources=["./csrc/src/kernel/flash_attention_tensor_op_binding.cpp", "./csrc/src/kernel/flash_attention_tensor_op_kernel.cu"],
-    extra_include_paths = ["./csrc/include", cutlass_path],
-    build_directory=build_dir,
-    verbose=False
-)
 
 def naive_attention(Q, K, V, scale=None):
     if scale is None:
@@ -44,8 +22,17 @@ def naive_attention(Q, K, V, scale=None):
     out = torch.matmul(attention, V)
     return out
 
+def custom_native_attention(Q, K, V):
+    return attention_extension.forward(Q, K, V)
+
+def custom_simt_attention(Q, K, V):
+    return flash_attention_simt_extension.forward(Q, K, V)
+
+def custom_tensor_op_attention(Q, K, V):
+    return flash_attention_tensor_op_extension.forward(Q, K, V)
+
 def custom_attention(Q, K, V):
-    return custom_flash_attention_tensor_op_extension.forward(Q, K, V)
+    return flash_attention_tensor_op_extension.forward(Q, K, V)
 
 #unsupport in sm75
 def pytorch_sdpa_flash(Q, K, V, scale=None):
@@ -70,82 +57,152 @@ def pytorch_sdpa(Q, K, V, scale=None):
     return pytorch_sdpa_mem_efficient(Q, K, V, scale)
 
 
-def run_correctness_check(batch=2, heads=4, seq_len=512, head_dim=64, device="cuda"):
+def run_correctness_check(batch=2, heads=4, seq_len=512, head_dim=128, device="cuda", dtype = torch.half):
     torch.manual_seed(42)
-    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
-    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
-    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
+    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
 
     ref = pytorch_sdpa(Q, K, V)
-    out = custom_attention(Q, K, V)
+    if Q.dtype == torch.half:
+        out = custom_tensor_op_attention(Q, K, V)
+    elif Q.dtype == torch.float32:
+        out = custom_simt_attention(Q, K, V)
 
     max_diff = (ref - out).abs().max().item() * (ref.abs().max().item() * out.abs().max().item() + 1e-6)**-0.5
     print(f"[correctness] custom vs sdpa: max_diff = {max_diff:.2e}")
     assert max_diff < 1e-3, f"correctness check failed: {max_diff}"
     print("[correctness] PASSED")
-    return Q, K, V, ref
+
+def run_benchmark(batch=4, heads=4, seq_len = 512, head_dim=128, warmup=100, iters=100, device="cuda", dtype = torch.half):
+    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+
+    if seq_len <= 2048:
+        for _ in range(warmup):
+            _ = custom_native_attention(Q, K, V)
+        torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        for _ in range(iters):
+            _ = custom_native_attention(Q, K, V)
+        torch.cuda.synchronize()
+        custom_native_ms = (time.perf_counter() - start) / iters * 1000
+    else :
+        custom_native_ms = 0.
+
+    if Q.dtype == torch.float32:
+        for _ in range(warmup):
+            _ = custom_simt_attention(Q, K, V)
+        torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        for _ in range(iters):
+            _ = custom_simt_attention(Q, K, V)
+        torch.cuda.synchronize()
+        custom_simt_ms = (time.perf_counter() - start) / iters * 1000
+    else:
+        custom_simt_ms = 0.
 
 
-def run_benchmark(Q, K, V, warmup=20, iters=100):
-    import time
+    if Q.dtype == torch.half:
+        for _ in range(warmup):
+            _ = custom_tensor_op_attention(Q, K, V)
+        torch.cuda.synchronize()
 
-    device = Q.device
+        start = time.perf_counter()
+        for _ in range(iters):
+            _ = custom_tensor_op_attention(Q, K, V)
+        torch.cuda.synchronize()
+        custom_tensor_op_ms = (time.perf_counter() - start) / iters * 1000
+    else:
+        custom_tensor_op_ms = 0.
+
+    if seq_len <= 2048:
+        for _ in range(warmup):
+            _ = pytorch_sdpa_math(Q, K, V)
+        torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        for _ in range(iters):
+            _ = pytorch_sdpa_math(Q, K, V)
+        torch.cuda.synchronize()
+        sdpa_math_ms = (time.perf_counter() - start) / iters * 1000
+    else:
+        sdpa_math_ms = 0.
 
     for _ in range(warmup):
-        _ = custom_attention(Q, K, V)
+        _ = pytorch_sdpa_mem_efficient(Q, K, V)
     torch.cuda.synchronize()
 
     start = time.perf_counter()
     for _ in range(iters):
-        _ = custom_attention(Q, K, V)
+        _ = pytorch_sdpa_mem_efficient(Q, K, V)
+
     torch.cuda.synchronize()
-    custom_ms = (time.perf_counter() - start) / iters * 1000
+    sdpa_mem_efficient_ms = (time.perf_counter() - start) / iters * 1000
 
-    for _ in range(warmup):
-        _ = pytorch_sdpa(Q, K, V)
+    return custom_native_ms, custom_simt_ms, custom_tensor_op_ms, sdpa_math_ms, sdpa_mem_efficient_ms
+
+def benchmark(warmup=100, iters=100, device="cuda", dtype = torch.half):
+
+    print(f"\n[benchmark]")
+    print(f"| seq_len | head_dim | custom native | custom simt | custom tensor | sdpa math | sdpa mem efficient |")
+    token_size = 8192
+    dim = 256
+    for seq_len in [256, 512, 1024, 2048, 4096, 8192]:
+        if seq_len > token_size:
+            break
+        for head_dim in [64, 128]:
+            custom_native_ms, custom_simt_ms, custom_tensor_op_ms, sdpa_math_ms, sdpa_mem_efficient_ms = run_benchmark(math.ceil(token_size / seq_len), math.ceil(dim / head_dim), seq_len, head_dim, warmup = warmup, iters = iters, device=device, dtype=dtype)
+            print(f"| {str(seq_len):>7.7} | {str(head_dim):>8.8} | {str(custom_native_ms):>13.13} | {str(custom_simt_ms):>11.11} | {str(custom_tensor_op_ms):>13.13} | {str(sdpa_math_ms):>9.9} | {str(sdpa_mem_efficient_ms):>18.18} |")
+
+def run_memory_check(batch=1, heads=1, seq_len = 512, head_dim=128, device="cuda", dtype = torch.half):
+    Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    _ = custom_native_attention(Q, K, V)
     torch.cuda.synchronize()
 
-    start = time.perf_counter()
-    for _ in range(iters):
-        _ = pytorch_sdpa(Q, K, V)
-    torch.cuda.synchronize()
-    sdpa_ms = (time.perf_counter() - start) / iters * 1000
-
-    print(f"\n[benchmark] seq_len={Q.shape[2]}, head_dim={Q.shape[3]}")
-    print(f"  custom attention : {custom_ms:.3f} ms")
-    print(f"  pytorch sdpa    : {sdpa_ms:.3f} ms")
-    print(f"  speedup (sdpa/custom): {custom_ms/sdpa_ms:.2f}x")
-
-    return {"custom_ms": custom_ms, "sdpa_ms": sdpa_ms}
-
-
-def run_memory_check(batch=2, heads=4, head_dim=64, device="cuda"):
-    print("\n[memory] peak allocated vs seq_len:")
-    print(f"  {'seq_len':>8}  {'custom (MB)':>12}  {'sdpa (MB)':>12}")
-
-    for seq_len in [256, 512, 1024]:
-        torch.manual_seed(0)
-        Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
-        K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
-        V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.half)
-
+    if Q.dtype == torch.float32:
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        _ = custom_attention(Q, K, V)
+        _ = custom_simt_attention(Q, K, V)
         torch.cuda.synchronize()
-        custom_mb = torch.cuda.max_memory_allocated() / 1e6
 
+    if Q.dtype == torch.half:
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        _ = pytorch_sdpa(Q, K, V)
+        _ = custom_tensor_op_attention(Q, K, V)
         torch.cuda.synchronize()
-        sdpa_mb = torch.cuda.max_memory_allocated() / 1e6
 
-        print(f"  {seq_len:>8}  {custom_mb:>12.1f}  {sdpa_mb:>12.1f}")
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    _ = pytorch_sdpa_math(Q, K, V)
+    torch.cuda.synchronize()
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    _ = pytorch_sdpa_mem_efficient(Q, K, V)
+    torch.cuda.synchronize()
+
+# use ncu to run this function
+def memory_check(batch=1, heads=1, device="cuda", dtype = torch.half):
+    for seq_len in [256, 512, 1024, 2048, 4096, 8192]:
+        for head_dim in [64, 128]:
+            run_memory_check(batch, heads, seq_len, head_dim, device = device, dtype = dtype)
 
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}\n")
 
-    Q, K, V, ref = run_correctness_check(device=device)
-    run_benchmark(Q, K, V)
-    run_memory_check(device=device)
+    dtype = torch.float16
+    print(f"dtype: {dtype}\n")
+    run_correctness_check(device=device, dtype = dtype)
+    benchmark(device=device, dtype = dtype)
+    # memory_check(device=device, dtype = dtype)

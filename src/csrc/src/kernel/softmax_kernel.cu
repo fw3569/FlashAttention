@@ -2,18 +2,18 @@
 #include "utils.cuh"
 
 #define BLOCK_SIZE 128
-#define MAX_TILE_SIZE 32
 
+template <int max_tile_size>
 __global__ void __launch_bounds__(BLOCK_SIZE, 8)
     softmax_kernel(float* a, float* result, int N) {
   __shared__ float s_result[BLOCK_SIZE >> 5];
   __shared__ float s_inv_expsum;
   __shared__ float s_maxa;
   float ans = -INFINITY;
-  float reg_result[MAX_TILE_SIZE];
+  float reg_result[max_tile_size];
   int base = blockIdx.x * N;
 #pragma unroll
-  for (int i = 0, pos = threadIdx.x; i < MAX_TILE_SIZE;
+  for (int i = 0, pos = threadIdx.x; i < max_tile_size;
        ++i, pos += BLOCK_SIZE) {
     if (pos < N) {
       reg_result[i] = a[base + pos];
@@ -41,7 +41,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 8)
   float reg_maxa = s_maxa;
   ans = 0.f;
 #pragma unroll
-  for (int i = 0, pos = threadIdx.x; i < MAX_TILE_SIZE;
+  for (int i = 0, pos = threadIdx.x; i < max_tile_size;
        ++i, pos += BLOCK_SIZE) {
     if (pos < N) {
       reg_result[i] = expf(reg_result[i] - reg_maxa);
@@ -68,7 +68,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 8)
   __syncthreads();
   float reg_inv_expsum = s_inv_expsum;
 #pragma unroll
-  for (int i = 0, pos = threadIdx.x; i < MAX_TILE_SIZE;
+  for (int i = 0, pos = threadIdx.x; i < max_tile_size;
        ++i, pos += BLOCK_SIZE) {
     if (pos < N) {
       float tmp = reg_result[i] * reg_inv_expsum;
@@ -126,8 +126,8 @@ bool inited = false;
 }  // namespace
 
 void softmax(float* a, float* result, int N) {
-  if (N <= BLOCK_SIZE * MAX_TILE_SIZE) {
-    softmax_kernel<<<1, BLOCK_SIZE>>>(a, result, N);
+  if (N <= BLOCK_SIZE * 32) {
+    softmax_kernel<32><<<1, BLOCK_SIZE>>>(a, result, N);
   } else {
     if (!inited) {
       global_exit_guard.Register([]() { softmaxDestroy(); });
@@ -148,8 +148,17 @@ void softmax(float* a, float* result, int N) {
   }
 }
 
-void softmax(float* a, float* result, int N, int M) {
-  softmax_kernel<<<N, BLOCK_SIZE>>>(a, result, M);
+void softmax(float* a, float* result, int M, int N) {
+  if (N <= BLOCK_SIZE * 32) {
+    softmax_kernel<32><<<M, BLOCK_SIZE>>>(reinterpret_cast<float*>(a),
+                                          reinterpret_cast<float*>(result), N);
+  } else if (N <= BLOCK_SIZE * 64) {
+    softmax_kernel<64><<<M, BLOCK_SIZE>>>(reinterpret_cast<float*>(a),
+                                          reinterpret_cast<float*>(result), N);
+  } else if (N <= BLOCK_SIZE * 128) {
+    softmax_kernel<128><<<M, BLOCK_SIZE>>>(reinterpret_cast<float*>(a),
+                                           reinterpret_cast<float*>(result), N);
+  }
 }
 
 void softmaxDestroy() {

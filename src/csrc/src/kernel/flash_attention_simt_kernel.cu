@@ -17,8 +17,6 @@
 #define BR (ROW_PER_WARP * WARP_PER_BLOCK)
 #define BC 64
 #define STRIDE 32
-#define KGROUPS 2
-#define MAX_HEAD_DIM (STRIDE * KGROUPS)
 
 namespace {
 using ElementQ = float;
@@ -73,6 +71,7 @@ struct SimtFragmentCoord {
 };
 }  // namespace
 
+template <int kgroups>
 __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
                                        int seq_len, int head_dim,
                                        bool is_causal = true) {
@@ -80,14 +79,15 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
   K += blockIdx.z * seq_len * head_dim;
   V += blockIdx.z * seq_len * head_dim;
   O += blockIdx.z * seq_len * head_dim;
-  __shared__ alignas(128) float s_br_d[BR][(MAX_HEAD_DIM + 4)];
+  constexpr int max_head_dim = (STRIDE * kgroups);
+  __shared__ alignas(128) float s_br_d[BR][(max_head_dim + 4)];
   __shared__ alignas(128) float s_bc_st[BC][(STRIDE + 4)];
   __shared__ alignas(128) float s_br_bc[BR][(BC + 4)];
   WarpMmaQKS mma_qks;
   WarpMmaSVO mma_svo;
-  WarpMmaSVO::FragmentC frag_o[KGROUPS];
+  WarpMmaSVO::FragmentC frag_o[kgroups];
   CUTLASS_PRAGMA_UNROLL
-  for (int i = 0; i < KGROUPS; ++i) {
+  for (int i = 0; i < kgroups; ++i) {
     frag_o[i].clear();
   }
   constexpr unsigned int row_per_lane = ROW_PER_WARP / Policy::WarpShape::kRow;
@@ -104,9 +104,9 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
   // load q
   int tilerow = blockIdx.y * BR;
   for (unsigned int offset = (threadIdx.y * 32 + threadIdx.x) * 4;
-       offset < BR * MAX_HEAD_DIM; offset += WARP_PER_BLOCK * 32 * 4) {
-    int col = offset & (MAX_HEAD_DIM - 1);
-    int row = offset / MAX_HEAD_DIM;
+       offset < BR * max_head_dim; offset += WARP_PER_BLOCK * 32 * 4) {
+    int col = offset & (max_head_dim - 1);
+    int row = offset / max_head_dim;
     if (tilerow + row < seq_len && col < head_dim) {
       __pipeline_memcpy_async((void*)(s_br_d[row] + col),
                               (void*)(Q + (tilerow + row) * head_dim + col),
@@ -124,7 +124,7 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
     frag_s.clear();
     WarpMmaQKS::IteratorA::TensorRef ref_q(
         s_br_d[threadIdx.y * ROW_PER_WARP],
-        cutlass::layout::RowMajor((MAX_HEAD_DIM + 4)));
+        cutlass::layout::RowMajor((max_head_dim + 4)));
     WarpMmaQKS::IteratorA iter_q(ref_q, threadIdx.x);
     for (int k = 0; k < head_dim; k += STRIDE) {
       for (unsigned int offset = (threadIdx.y * 32 + threadIdx.x) * 4;
@@ -234,7 +234,7 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
     {
       constexpr unsigned int col_size = STRIDE / Policy::WarpShape::kColumn;
       CUTLASS_PRAGMA_UNROLL
-      for (int k = 0; k < KGROUPS; ++k) {
+      for (int k = 0; k < kgroups; ++k) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < WarpMmaSVO::FragmentC::kElements / col_size; ++i) {
           CUTLASS_PRAGMA_UNROLL
@@ -246,7 +246,7 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
     }
 
     // mul v
-    for (unsigned int k = 0; k < KGROUPS; ++k) {
+    for (unsigned int k = 0; k < kgroups; ++k) {
       for (unsigned int offset = (threadIdx.y * 32 + threadIdx.x) * 4;
            offset < BC * STRIDE; offset += WARP_PER_BLOCK * 32 * 4) {
         int col = (offset & (STRIDE - 1));
@@ -290,7 +290,7 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
     }
     constexpr unsigned int col_size = STRIDE / Policy::WarpShape::kColumn;
     CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < KGROUPS; ++k) {
+    for (int k = 0; k < kgroups; ++k) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < WarpMmaSVO::FragmentC::kElements / col_size; ++i) {
         CUTLASS_PRAGMA_UNROLL
@@ -304,10 +304,10 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
   // store o
   {
     int row = threadIdx.y * ROW_PER_WARP;
-    for (int k = 0, col = 0; k < KGROUPS; ++k, col += STRIDE) {
+    for (int k = 0, col = 0; k < kgroups; ++k, col += STRIDE) {
       FragIterSVO frag_iter(frag_o[k]);
       TileIterSVO::TensorRef ref_o(
-          s_br_d[row] + col, cutlass::layout::RowMajor((MAX_HEAD_DIM + 4)));
+          s_br_d[row] + col, cutlass::layout::RowMajor((max_head_dim + 4)));
       TileIterSVO tile_iter(ref_o, threadIdx.x);
       CUTLASS_PRAGMA_UNROLL
       for (int iter = 0; iter < FragIterSVO::kIterations; ++iter) {
@@ -320,9 +320,9 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
     }
     __syncthreads();
     for (unsigned int offset = (threadIdx.y * 32 + threadIdx.x) * 4;
-         offset < BR * MAX_HEAD_DIM; offset += WARP_PER_BLOCK * 32 * 4) {
-      int col = offset & (MAX_HEAD_DIM - 1);
-      int row = offset / MAX_HEAD_DIM;
+         offset < BR * max_head_dim; offset += WARP_PER_BLOCK * 32 * 4) {
+      int col = offset & (max_head_dim - 1);
+      int row = offset / max_head_dim;
       if (tilerow + row < seq_len && col < head_dim) {
         __pipeline_memcpy_async((void*)(O + (tilerow + row) * head_dim + col),
                                 (void*)(s_br_d[row] + col), 16);
@@ -333,8 +333,9 @@ __global__ void flash_attention_kernel(float* Q, float* K, float* V, float* O,
   }
 }
 
-torch::Tensor flash_attention_simt_forward(torch::Tensor Q, torch::Tensor K,
-                                           torch::Tensor V) {
+torch::Tensor flash_attention_simt_forward(const torch::Tensor& Q,
+                                           const torch::Tensor& K,
+                                           const torch::Tensor& V) {
   TORCH_CHECK(Q.is_cuda(), "Q must be CUDA tensor");
   TORCH_CHECK(K.is_cuda(), "K must be CUDA tensor");
   TORCH_CHECK(V.is_cuda(), "V must be CUDA tensor");
@@ -347,13 +348,19 @@ torch::Tensor flash_attention_simt_forward(torch::Tensor Q, torch::Tensor K,
   int seq_len = Q.size(2);
   int head_dim = Q.size(3);
 
-  auto O = torch::zeros({batch, heads, seq_len, head_dim}, Q.options());
+  auto O = torch::empty({batch, heads, seq_len, head_dim}, Q.options());
 
   dim3 block(32, WARP_PER_BLOCK);
   dim3 grid(1, (seq_len + BR - 1) / BR, batch * heads);
-  flash_attention_kernel<<<grid, block>>>(
-      Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
-      O.data_ptr<float>(), seq_len, head_dim, true);
+  if (head_dim <= 64) {
+    flash_attention_kernel<2><<<grid, block>>>(
+        Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
+        O.data_ptr<float>(), seq_len, head_dim, true);
+  } else {
+    flash_attention_kernel<4><<<grid, block>>>(
+        Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
+        O.data_ptr<float>(), seq_len, head_dim, true);
+  }
 
   return O;
 }
