@@ -5,7 +5,19 @@ os.environ["DISTUTILS_USE_SDK"] = "1"
 from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
-cutlass_path = "D:/Project/cutlass/include"
+if sys.platform == "win32":
+    cutlass_path = "D:/Project/cutlass/include"
+    extra_compile_args = {
+        "nvcc": ["-O3", "-lineinfo"],
+        "cxx": ["/O2"],
+    }
+else:
+    cutlass_path = "/mnt/d/Project/cutlass/include"
+    extra_compile_args = {
+        "nvcc": ["-O3", "-lineinfo"],
+        "cxx": ["-O3"],
+    }
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 build_dir = os.path.join(ROOT, "build")
 os.makedirs(build_dir, exist_ok=True)
@@ -23,10 +35,7 @@ setup(
             ],
             libraries=["cublas"],
             include_dirs=[os.path.join(ROOT, "csrc/include")],
-            extra_compile_args={
-                "nvcc": ["-O3", "-lineinfo"],
-                "cxx": ["/O2"],
-            },
+            extra_compile_args=extra_compile_args,
         ),
         CUDAExtension(
             name="flash_attention_simt_extension",
@@ -35,10 +44,7 @@ setup(
                 os.path.join(ROOT, "csrc/src/kernel/flash_attention_simt_kernel.cu"),
             ],
             include_dirs=[os.path.join(ROOT, "csrc/include"), cutlass_path],
-            extra_compile_args={
-                "nvcc": ["-O3", "-lineinfo"],
-                "cxx": ["/O2"],
-            },
+            extra_compile_args=extra_compile_args,
         ),
         CUDAExtension(
             name="flash_attention_tensor_op_extension",
@@ -47,10 +53,7 @@ setup(
                 os.path.join(ROOT, "csrc/src/kernel/flash_attention_tensor_op_kernel.cu"),
             ],
             include_dirs=[os.path.join(ROOT, "csrc/include"), cutlass_path],
-            extra_compile_args={
-                "nvcc": ["-O3", "-lineinfo"],
-                "cxx": ["/O2"],
-            },
+            extra_compile_args=extra_compile_args,
         ),
     ],
     cmdclass={"build_ext": BuildExtension},

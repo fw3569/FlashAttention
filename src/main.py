@@ -4,6 +4,8 @@ import time
 import math
 import torch
 import torch.nn.functional as F
+from xformers.ops import memory_efficient_attention as xformers_mea
+from xformers.ops import LowerTriangularMask
 sys.path.insert(0, "./build")
 import attention_extension
 import flash_attention_simt_extension
@@ -56,6 +58,14 @@ def pytorch_sdpa_cudnn(Q, K, V, scale=None):
 def pytorch_sdpa(Q, K, V, scale=None):
     return pytorch_sdpa_mem_efficient(Q, K, V, scale)
 
+# [B, S, H, D]
+def xformers_attention(Q, K, V, scale=None):
+    out = xformers_mea(
+        Q, K, V,
+        attn_bias=LowerTriangularMask(),
+        scale=scale,
+    )
+    return out
 
 def run_correctness_check(batch=2, heads=4, seq_len=512, head_dim=128, device="cuda", dtype = torch.half):
     torch.manual_seed(42)
@@ -78,117 +88,126 @@ def run_benchmark(batch=4, heads=4, seq_len = 512, head_dim=128, warmup=100, ite
     Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
     K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
     V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
     if seq_len <= 2048:
         for _ in range(warmup):
-            _ = custom_native_attention(Q, K, V)
+            custom_native_attention(Q, K, V)
         torch.cuda.synchronize()
 
-        start = time.perf_counter()
+        start_event.record()
         for _ in range(iters):
-            _ = custom_native_attention(Q, K, V)
+            custom_native_attention(Q, K, V)
+        end_event.record()
         torch.cuda.synchronize()
-        custom_native_ms = (time.perf_counter() - start) / iters * 1000
+        custom_native_ms = start_event.elapsed_time(end_event) / iters
     else :
         custom_native_ms = 0.
 
     if Q.dtype == torch.float32:
         for _ in range(warmup):
-            _ = custom_simt_attention(Q, K, V)
+            custom_simt_attention(Q, K, V)
         torch.cuda.synchronize()
 
-        start = time.perf_counter()
+        start_event.record()
         for _ in range(iters):
-            _ = custom_simt_attention(Q, K, V)
+            custom_simt_attention(Q, K, V)
+        end_event.record()
         torch.cuda.synchronize()
-        custom_simt_ms = (time.perf_counter() - start) / iters * 1000
+        custom_simt_ms = start_event.elapsed_time(end_event) / iters
     else:
         custom_simt_ms = 0.
 
 
     if Q.dtype == torch.half:
         for _ in range(warmup):
-            _ = custom_tensor_op_attention(Q, K, V)
+            custom_tensor_op_attention(Q, K, V)
         torch.cuda.synchronize()
 
-        start = time.perf_counter()
+        start_event.record()
         for _ in range(iters):
-            _ = custom_tensor_op_attention(Q, K, V)
+            custom_tensor_op_attention(Q, K, V)
+        end_event.record()
         torch.cuda.synchronize()
-        custom_tensor_op_ms = (time.perf_counter() - start) / iters * 1000
+        custom_tensor_op_ms = start_event.elapsed_time(end_event) / iters
     else:
         custom_tensor_op_ms = 0.
 
     if seq_len <= 2048:
         for _ in range(warmup):
-            _ = pytorch_sdpa_math(Q, K, V)
+            pytorch_sdpa_math(Q, K, V)
         torch.cuda.synchronize()
 
-        start = time.perf_counter()
+        start_event.record()
         for _ in range(iters):
-            _ = pytorch_sdpa_math(Q, K, V)
+            pytorch_sdpa_math(Q, K, V)
+        end_event.record()
         torch.cuda.synchronize()
-        sdpa_math_ms = (time.perf_counter() - start) / iters * 1000
+        sdpa_math_ms = start_event.elapsed_time(end_event) / iters
     else:
         sdpa_math_ms = 0.
 
     for _ in range(warmup):
-        _ = pytorch_sdpa_mem_efficient(Q, K, V)
+        pytorch_sdpa_mem_efficient(Q, K, V)
     torch.cuda.synchronize()
 
-    start = time.perf_counter()
+    start_event.record()
     for _ in range(iters):
-        _ = pytorch_sdpa_mem_efficient(Q, K, V)
-
+        pytorch_sdpa_mem_efficient(Q, K, V)
+    end_event.record()
     torch.cuda.synchronize()
-    sdpa_mem_efficient_ms = (time.perf_counter() - start) / iters * 1000
+    sdpa_mem_efficient_ms = start_event.elapsed_time(end_event) / iters
 
-    return custom_native_ms, custom_simt_ms, custom_tensor_op_ms, sdpa_math_ms, sdpa_mem_efficient_ms
+    b, h, s, d = Q.shape
+    # wrong anwser to redefine data, only for benchmark
+    Q_p = Q.as_strided((b, s, h, d), (h*s*d, d, s*d, 1))
+    K_p = K.as_strided((b, s, h, d), (h*s*d, d, s*d, 1))
+    V_p = V.as_strided((b, s, h, d), (h*s*d, d, s*d, 1))
+    for _ in range(10):
+        xformers_attention(Q_p, K_p, V_p)
+    torch.cuda.synchronize()
+
+    start_event.record()
+    for _ in range(iters):
+        xformers_attention(Q_p, K_p, V_p)
+    end_event.record()
+    torch.cuda.synchronize()
+    xformers_ms = start_event.elapsed_time(end_event) / iters
+
+    return custom_native_ms, custom_simt_ms, custom_tensor_op_ms, sdpa_math_ms, sdpa_mem_efficient_ms, xformers_ms
 
 def benchmark(warmup=100, iters=100, device="cuda", dtype = torch.half):
 
     print(f"\n[benchmark]")
-    print(f"| seq_len | head_dim | custom native | custom simt | custom tensor | sdpa math | sdpa mem efficient |")
+    print(f"| seq_len | head_dim | custom native | custom simt | custom tensor | sdpa math | sdpa mem efficient | xformers |")
     token_size = 8192
     dim = 256
     for seq_len in [256, 512, 1024, 2048, 4096, 8192]:
         if seq_len > token_size:
             break
         for head_dim in [64, 128]:
-            custom_native_ms, custom_simt_ms, custom_tensor_op_ms, sdpa_math_ms, sdpa_mem_efficient_ms = run_benchmark(math.ceil(token_size / seq_len), math.ceil(dim / head_dim), seq_len, head_dim, warmup = warmup, iters = iters, device=device, dtype=dtype)
-            print(f"| {str(seq_len):>7.7} | {str(head_dim):>8.8} | {str(custom_native_ms):>13.13} | {str(custom_simt_ms):>11.11} | {str(custom_tensor_op_ms):>13.13} | {str(sdpa_math_ms):>9.9} | {str(sdpa_mem_efficient_ms):>18.18} |")
+            custom_native_ms, custom_simt_ms, custom_tensor_op_ms, sdpa_math_ms, sdpa_mem_efficient_ms, xformers_ms = run_benchmark(math.ceil(token_size / seq_len), math.ceil(dim / head_dim), seq_len, head_dim, warmup = warmup, iters = iters, device=device, dtype=dtype)
+            print(f"| {str(seq_len):>7.7} | {str(head_dim):>8.8} | {str(custom_native_ms):>13.13} | {str(custom_simt_ms):>11.11} | {str(custom_tensor_op_ms):>13.13} | {str(sdpa_math_ms):>9.9} | {str(sdpa_mem_efficient_ms):>18.18} | {str(xformers_ms):>8.8} |")
 
 def run_memory_check(batch=1, heads=1, seq_len = 512, head_dim=128, device="cuda", dtype = torch.half):
     Q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
     K = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
     V = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=dtype)
 
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    _ = custom_native_attention(Q, K, V)
-    torch.cuda.synchronize()
-
+    custom_native_attention(Q, K, V)
     if Q.dtype == torch.float32:
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        _ = custom_simt_attention(Q, K, V)
-        torch.cuda.synchronize()
-
+        custom_simt_attention(Q, K, V)
     if Q.dtype == torch.half:
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        _ = custom_tensor_op_attention(Q, K, V)
-        torch.cuda.synchronize()
-
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    _ = pytorch_sdpa_math(Q, K, V)
-    torch.cuda.synchronize()
-
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    _ = pytorch_sdpa_mem_efficient(Q, K, V)
-    torch.cuda.synchronize()
+        custom_tensor_op_attention(Q, K, V)
+    pytorch_sdpa_math(Q, K, V)
+    pytorch_sdpa_mem_efficient(Q, K, V)
+    b, h, s, d = Q.shape
+    # wrong anwser to redefine data, only for benchmark
+    Q_p = Q.as_strided((b, s, h, d), (h*s*d, d, s*d, 1))
+    K_p = K.as_strided((b, s, h, d), (h*s*d, d, s*d, 1))
+    V_p = V.as_strided((b, s, h, d), (h*s*d, d, s*d, 1))
+    xformers_attention(Q_p, K_p, V_p)
 
 # use ncu to run this function
 def memory_check(batch=1, heads=1, device="cuda", dtype = torch.half):
