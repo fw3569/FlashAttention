@@ -13,12 +13,13 @@
 #include <nvrtc.h>
 
 #include "flash_attention_tensor_op_kernel.cuh"
+#include "ldsm.cuh"
 
 #define WARP_PER_BLOCK 1
 #define ROW_PER_WARP 16
 #define BR (ROW_PER_WARP * WARP_PER_BLOCK)
 #define BC 32
-#define STRIDE 16
+#define STRIDE 32
 
 namespace {
 using ElementA = cutlass::half_t;
@@ -53,7 +54,7 @@ using TileIterQKS = cutlass::epilogue::warp::TileIteratorTensorOp<
 
 using WarpMmaSVO = cutlass::gemm::warp::MmaTensorOp<
     WarpShapeSVO, Operator::ElementA, Operator::LayoutA, Operator::ElementB,
-    Operator::LayoutB, Operator::ElementC, Operator::LayoutC, Policy>;
+    cutlass::layout::RowMajor, Operator::ElementC, Operator::LayoutC, Policy>;
 using FragIterSVO = cutlass::epilogue::warp::FragmentIteratorTensorOp<
     WarpShapeSVO, WarpMmaSVO::InstructionShape, ElementC,
     cutlass::Array<ElementC, Operator::FragmentC::kElements>, LayoutC>;
@@ -70,7 +71,7 @@ constexpr unsigned int kRowsPerQuad = (ROW_PER_WARP / kRowsPerIteration);
 constexpr unsigned int kMaxBcStride = std::max(BC, STRIDE);
 
 template <typename WarpShape>
-struct SimtFragmentCoord {
+struct FragmentCoord {
   static CUTLASS_DEVICE cutlass::MatrixCoord get_element_coord(
       unsigned int element_id, unsigned int lane_id) {
     using OperatorCount = cutlass::MatrixShape<
@@ -87,22 +88,27 @@ struct SimtFragmentCoord {
                                 thread_col + access_col + col};
   }
 };
+
+template <int max_head_dim = 128>
+struct Smem {
+  alignas(128) cutlass::half_t s_br_d[BR][(max_head_dim + 8)];
+  alignas(128) cutlass::half_t s_bc_st[2][BC * STRIDE + kMaxBcStride * 8];
+  // alignas(128) cutlass::half_t s_br_bc[BR][(BC + 8)];
+};
 }  // namespace
 
-template <int kgroups>
-__global__ void __launch_bounds__(WARP_PER_BLOCK * 32)
+template <bool aligned_block, int kgroups, bool is_causal = true>
+__global__ void __launch_bounds__(WARP_PER_BLOCK * 32, 2)
     flash_attention_kernel(cutlass::half_t* Q, cutlass::half_t* K,
                            cutlass::half_t* V, cutlass::half_t* O, int seq_len,
-                           int head_dim, bool is_causal = true) {
+                           int head_dim) {
   Q += blockIdx.z * seq_len * head_dim;
   K += blockIdx.z * seq_len * head_dim;
   V += blockIdx.z * seq_len * head_dim;
   O += blockIdx.z * seq_len * head_dim;
   constexpr int max_head_dim = (STRIDE * kgroups);
-  __shared__ alignas(128) cutlass::half_t s_br_d[BR][(max_head_dim + 8)];
-  __shared__ alignas(128)
-      cutlass::half_t s_bc_st[BC * STRIDE + kMaxBcStride * 8];
-  __shared__ alignas(128) cutlass::half_t s_br_bc[BR][(BC + 8)];
+  extern __shared__ __align__(128) float raw_smem[];
+  Smem<max_head_dim>& smem = reinterpret_cast<Smem<max_head_dim>(&)>(raw_smem);
   WarpMmaQKS mma_qks;
   WarpMmaSVO mma_svo;
   WarpMmaSVO::FragmentC frag_o[kgroups];
@@ -128,54 +134,125 @@ __global__ void __launch_bounds__(WARP_PER_BLOCK * 32)
        offset += 32 * 8) {
     int col = (offset + threadIdx.x * 8) & (max_head_dim - 1);
     int row = (offset + threadIdx.x * 8) / max_head_dim + warprow;
-    if (tilerow + row < seq_len && col < head_dim) {
-      __pipeline_memcpy_async((void*)(s_br_d[row] + col),
+    if (aligned_block || tilerow + row < seq_len && col < head_dim) {
+      __pipeline_memcpy_async((void*)(smem.s_br_d[row] + col),
                               (void*)(Q + (tilerow + row) * head_dim + col),
                               16);
     } else {
-      __pipeline_memcpy_async((void*)(s_br_d[row] + col), nullptr, 16, 16);
+      __pipeline_memcpy_async((void*)(smem.s_br_d[row] + col), nullptr, 16, 16);
     }
   }
 
+  int cache_id = 0;
   // mul k
-  for (int tilecol = 0;
-       tilecol < seq_len && (!is_causal || tilecol < tilerow + BR);
-       tilecol += BC) {
+  for (int tilecol = 0; tilecol < seq_len; tilecol += BC) {
+    if (is_causal && tilecol >= tilerow + BR) {
+      break;
+    }
     WarpMmaQKS::FragmentC frag_s;
     frag_s.clear();
-    CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < head_dim; k += STRIDE) {
+    {
+#if (WARP_PER_BLOCK * 32 * 8 < BC * STRIDE)
       CUTLASS_PRAGMA_UNROLL
       for (unsigned int offset = 0; offset < BC * STRIDE;
            offset += WARP_PER_BLOCK * 32 * 8) {
         int col =
             ((offset + (threadIdx.y * 32 + threadIdx.x) * 8) & (STRIDE - 1));
         int row = (offset + (threadIdx.y * 32 + threadIdx.x) * 8) / STRIDE;
-        // aligned to float4
-        if (tilecol + row < seq_len && k + col < head_dim) {
+#if ((BC * STRIDE) % (WARP_PER_BLOCK * 32 * 8) != 0)
+        if (row >= BC) {
+          break;
+        }
+#endif
+#else
+#if (WARP_PER_BLOCK * 32 * 8 > BC * STRIDE)
+      if (threadIdx.y * 32 + threadIdx.x < (BC * STRIDE / 8)) {
+#else
+      {
+#endif
+        int col = (((threadIdx.y * 32 + threadIdx.x) * 8) & (STRIDE - 1));
+        int row = ((threadIdx.y * 32 + threadIdx.x) * 8) / STRIDE;
+#endif
+        if (aligned_block || tilecol + row < seq_len && col < head_dim) {
           __pipeline_memcpy_async(
-              (void*)(s_bc_st + row * (STRIDE + 8) + col),
-              (void*)(K + (tilecol + row) * head_dim + k + col), 16);
+              (void*)(smem.s_bc_st[cache_id] + row * (STRIDE + 8) + col),
+              (void*)(K + (tilecol + row) * head_dim + col), 16);
         } else {
-          __pipeline_memcpy_async((void*)(s_bc_st + row * (STRIDE + 8) + col),
-                                  nullptr, 16, 16);
+          __pipeline_memcpy_async(
+              (void*)(smem.s_bc_st[cache_id] + row * (STRIDE + 8) + col),
+              nullptr, 16, 16);
         }
       }
       __pipeline_commit();
-      __pipeline_wait_prior(0);
+      cache_id ^= 1;
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int k = 0; k < head_dim; k += STRIDE) {
+      if (k + STRIDE < head_dim) {
+#if (WARP_PER_BLOCK * 32 * 8 < BC * STRIDE)
+        CUTLASS_PRAGMA_UNROLL
+        for (unsigned int offset = 0; offset < BC * STRIDE;
+             offset += WARP_PER_BLOCK * 32 * 8) {
+          int col =
+              ((offset + (threadIdx.y * 32 + threadIdx.x) * 8) & (STRIDE - 1));
+          int row = (offset + (threadIdx.y * 32 + threadIdx.x) * 8) / STRIDE;
+#if ((BC * STRIDE) % (WARP_PER_BLOCK * 32 * 8) != 0)
+          if (row >= BC) {
+            break;
+          }
+#endif
+#else
+#if (WARP_PER_BLOCK * 32 * 8 > BC * STRIDE)
+        if (threadIdx.y * 32 + threadIdx.x < (BC * STRIDE / 8)) {
+#else
+        {
+#endif
+          int col = (((threadIdx.y * 32 + threadIdx.x) * 8) & (STRIDE - 1));
+          int row = ((threadIdx.y * 32 + threadIdx.x) * 8) / STRIDE;
+#endif
+          if (aligned_block ||
+              tilecol + row < seq_len && k + STRIDE + col < head_dim) {
+            __pipeline_memcpy_async(
+                (void*)(smem.s_bc_st[cache_id] + row * (STRIDE + 8) + col),
+                (void*)(K + (tilecol + row) * head_dim + k + STRIDE + col), 16);
+          } else {
+            __pipeline_memcpy_async(
+                (void*)(smem.s_bc_st[cache_id] + row * (STRIDE + 8) + col),
+                nullptr, 16, 16);
+          }
+        }
+      }
+      __pipeline_commit();
+      cache_id ^= 1;
+      __pipeline_wait_prior(1);
       __syncthreads();
       CUTLASS_PRAGMA_UNROLL
       for (int kk = 0; kk < STRIDE; kk += OperatorShape::kK) {
-        WarpMmaQKS::IteratorA::TensorRef ref_q(s_br_d[warprow] + k + kk,
-                                               LayoutA((max_head_dim + 8)));
-        WarpMmaQKS::IteratorA iter_q(ref_q, threadIdx.x);
-        WarpMmaQKS::IteratorB::TensorRef ref_k(s_bc_st + kk,
-                                               LayoutB((STRIDE + 8)));
-        WarpMmaQKS::IteratorB iter_k(ref_k, threadIdx.x);
         WarpMmaQKS::FragmentA frag_q;
         WarpMmaQKS::FragmentB frag_k;
-        iter_q.load(frag_q);
-        iter_k.load(frag_k);
+        constexpr int frag_qstride =
+            (OperatorShape::kM * OperatorShape::kK / 32 / 2);
+        CUTLASS_PRAGMA_UNROLL
+        for (int t = 0; t * OperatorShape::kM < ROW_PER_WARP; ++t) {
+          __ldsm<cutlass::layout::RowMajor, frag_qstride>(
+              *(reinterpret_cast<cutlass::Array<unsigned, frag_qstride>*>(
+                    &frag_q) +
+                t),
+              smem.s_br_d[warprow + t * OperatorShape::kM] + k + kk,
+              max_head_dim + 8, threadIdx.x);
+        }
+        constexpr int frag_kstride =
+            (OperatorShape::kN * OperatorShape::kK / 32 / 2);
+        CUTLASS_PRAGMA_UNROLL
+        for (int t = 0; t * OperatorShape::kN < BC; ++t) {
+          __ldsm<cutlass::layout::RowMajor, frag_kstride>(
+              *(reinterpret_cast<cutlass::Array<unsigned, frag_kstride>*>(
+                    &frag_k) +
+                t),
+              smem.s_bc_st[cache_id] + kk +
+                  t * OperatorShape::kN * (STRIDE + 8),
+              STRIDE + 8, threadIdx.x);
+        }
         mma_qks(frag_s, frag_q, frag_k, frag_s);
       }
       __syncthreads();
@@ -183,13 +260,16 @@ __global__ void __launch_bounds__(WARP_PER_BLOCK * 32)
     frag_s = frag_s * inv_sqrt_head_dim;
 
     // causal mask
-    if (is_causal) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < WarpMmaQKS::FragmentC::kElements; ++i) {
-        auto coord =
-            SimtFragmentCoord<WarpShapeQKS>::get_element_coord(i, threadIdx.x);
-        if (tilecol + coord.column() > tilerow + warprow + coord.row()) {
-          frag_s[i] = 0;
+    if constexpr (is_causal) {
+      if (tilerow <= tilecol && tilecol < tilerow + BR ||
+          tilecol <= tilerow && tilerow < tilecol + BC) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < WarpMmaQKS::FragmentC::kElements; ++i) {
+          auto coord =
+              FragmentCoord<WarpShapeQKS>::get_element_coord(i, threadIdx.x);
+          if (tilecol + coord.column() > tilerow + warprow + coord.row()) {
+            frag_s[i] = -INFINITY;
+          }
         }
       }
     }
@@ -199,22 +279,23 @@ __global__ void __launch_bounds__(WARP_PER_BLOCK * 32)
       int thread_row = threadIdx.x / kLanesInQuad + warprow + tilerow;
       int thread_col =
           (threadIdx.x & (kLanesInQuad - 1)) * kElementsPerAccess + tilecol;
+      int frag_id[kElementPerIteration];
+      CUTLASS_PRAGMA_UNROLL
+      for (int idx_in_row = 0; idx_in_row < kElementPerIteration;
+           ++idx_in_row) {
+        frag_id[idx_in_row] =
+            (idx_in_row & ~(kElementsPerAccess - 1)) * kRowsPerQuad +
+            (idx_in_row & (kElementsPerAccess - 1));
+      }
       CUTLASS_PRAGMA_UNROLL
       for (int m = 0; m < kRowsPerQuad; ++m) {
         int row = m * kRowsPerIteration + thread_row;
         float new_m = reg_m[m];
         CUTLASS_PRAGMA_UNROLL
-        for (int idx_in_row = 0;
-             idx_in_row < kElementPerIteration &&
-             (!is_causal || row >= thread_col +
-                                       (idx_in_row / kElementsPerAccess << 3) +
-                                       idx_in_row % kElementsPerAccess);
+        for (int idx_in_row = 0; idx_in_row < kElementPerIteration;
              ++idx_in_row) {
-          new_m = max(
-              new_m,
-              frag_s[m * kElementsPerAccess +
-                     (idx_in_row & ~(kElementsPerAccess - 1)) * kRowsPerQuad +
-                     (idx_in_row & (kElementsPerAccess - 1))]);
+          new_m =
+              max(new_m, frag_s[m * kElementsPerAccess + frag_id[idx_in_row]]);
         }
         CUTLASS_PRAGMA_UNROLL
         for (int i = kLanesInQuad >> 1; i >= 1; i >>= 1) {
@@ -222,16 +303,9 @@ __global__ void __launch_bounds__(WARP_PER_BLOCK * 32)
         }
         float new_l = 0;
         CUTLASS_PRAGMA_UNROLL
-        for (int idx_in_row = 0;
-             idx_in_row < kElementPerIteration &&
-             (!is_causal || row >= thread_col +
-                                       (idx_in_row / kElementsPerAccess << 3) +
-                                       idx_in_row % kElementsPerAccess);
+        for (int idx_in_row = 0; idx_in_row < kElementPerIteration;
              ++idx_in_row) {
-          int id_in_frag =
-              m * kElementsPerAccess +
-              (idx_in_row & ~(kElementsPerAccess - 1)) * kRowsPerQuad +
-              (idx_in_row & (kElementsPerAccess - 1));
+          int id_in_frag = m * kElementsPerAccess + frag_id[idx_in_row];
           float temp_s = expf(frag_s[id_in_frag] - new_m);
           frag_s[id_in_frag] = temp_s;
           new_l += temp_s;
@@ -245,25 +319,25 @@ __global__ void __launch_bounds__(WARP_PER_BLOCK * 32)
         reg_l[m] = reg_l[m] * reg_expdiffm[m] + new_l;
       }
     }
-    {
-      cutlass::Array<ElementC, WarpMmaQKS::FragmentC::kElements> frag_s16;
-      cutlass::NumericArrayConverter<ElementC, ElementAccum,
-                                     WarpMmaQKS::FragmentC::kElements>
-          convert;
-      frag_s16 = convert(frag_s);
+    // {
+    //   cutlass::Array<ElementC, WarpMmaQKS::FragmentC::kElements> frag_s16;
+    //   cutlass::NumericArrayConverter<ElementC, ElementAccum,
+    //                                  WarpMmaQKS::FragmentC::kElements>
+    //       convert;
+    //   frag_s16 = convert(frag_s);
 
-      FragIterQKS frag_iter(frag_s16);
-      TileIterQKS::TensorRef ref_s(s_br_bc[warprow], LayoutC((BC + 8)));
-      TileIterQKS tile_iter(ref_s, threadIdx.x);
-      CUTLASS_PRAGMA_UNROLL
-      for (int iter = 0; iter < FragIterQKS::kIterations; ++iter) {
-        FragIterQKS::Fragment frag;
-        frag_iter.load(frag, 0);
-        tile_iter.store(frag);
-        ++frag_iter;
-        tile_iter.add_tile_offset({1, 0});
-      }
-    }
+    //   FragIterQKS frag_iter(frag_s16);
+    //   TileIterQKS::TensorRef ref_s(smem.s_br_bc[warprow], LayoutC((BC + 8)));
+    //   TileIterQKS tile_iter(ref_s, threadIdx.x);
+    //   CUTLASS_PRAGMA_UNROLL
+    //   for (int iter = 0; iter < FragIterQKS::kIterations; ++iter) {
+    //     FragIterQKS::Fragment frag;
+    //     frag_iter.load(frag, 0);
+    //     tile_iter.store(frag);
+    //     ++frag_iter;
+    //     tile_iter.add_tile_offset({1, 0});
+    //   }
+    // }
 
     // find row of fragment c and rescale exp
     {
@@ -281,43 +355,123 @@ __global__ void __launch_bounds__(WARP_PER_BLOCK * 32)
     }
 
     // mul v
-    CUTLASS_PRAGMA_UNROLL
-    for (unsigned int k = 0; k < kgroups; ++k) {
-      // transpose, tensor mma need ColumnMajor B
+    {
+      cache_id = 0;
+#if (WARP_PER_BLOCK * 32 * 8 < BC * STRIDE)
       CUTLASS_PRAGMA_UNROLL
       for (unsigned int offset = 0; offset < BC * STRIDE;
            offset += WARP_PER_BLOCK * 32 * 8) {
         int col =
             ((offset + (threadIdx.y * 32 + threadIdx.x) * 8) & (STRIDE - 1));
         int row = (offset + (threadIdx.y * 32 + threadIdx.x) * 8) / STRIDE;
-        if (tilecol + row < seq_len && k * STRIDE + col < head_dim) {
-          cutlass::half_t buffer[8];
-          *(float4*)(buffer) =
-              *(float4*)(V + (tilecol + row) * head_dim + k * STRIDE + col);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < 8; ++i) {
-            *(s_bc_st + (col + i) * (BC + 8) + row) = buffer[i];
-          }
+#if ((BC * STRIDE) % (WARP_PER_BLOCK * 32 * 8) != 0)
+        if (row >= BC) {
+          break;
+        }
+#endif
+#else
+#if (WARP_PER_BLOCK * 32 * 8 > BC * STRIDE)
+      if (threadIdx.y * 32 + threadIdx.x < (BC * STRIDE / 8)) {
+#else
+      {
+#endif
+        int col = (((threadIdx.y * 32 + threadIdx.x) * 8) & (STRIDE - 1));
+        int row = ((threadIdx.y * 32 + threadIdx.x) * 8) / STRIDE;
+#endif
+        if (aligned_block || tilecol + row < seq_len && col < head_dim) {
+          __pipeline_memcpy_async(
+              (void*)(smem.s_bc_st[cache_id] + row * (STRIDE + 8) + col),
+              (void*)(V + (tilecol + row) * head_dim + col), 16);
         } else {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < 8; ++i) {
-            *(s_bc_st + (col + i) * (BC + 8) + row) = (cutlass::half_t)0.f;
+          __pipeline_memcpy_async(
+              (void*)(smem.s_bc_st[cache_id] + row * (STRIDE + 8) + col),
+              nullptr, 16, 16);
+        }
+      }
+      __pipeline_commit();
+      cache_id ^= 1;
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (unsigned int k = 0; k < kgroups; ++k) {
+      // transpose, tensor mma need ColumnMajor B
+      if (k + 1 < kgroups) {
+#if (WARP_PER_BLOCK * 32 * 8 < BC * STRIDE)
+        CUTLASS_PRAGMA_UNROLL
+        for (unsigned int offset = 0; offset < BC * STRIDE;
+             offset += WARP_PER_BLOCK * 32 * 8) {
+          int col =
+              ((offset + (threadIdx.y * 32 + threadIdx.x) * 8) & (STRIDE - 1));
+          int row = (offset + (threadIdx.y * 32 + threadIdx.x) * 8) / STRIDE;
+#if ((BC * STRIDE) % (WARP_PER_BLOCK * 32 * 8) != 0)
+          if (row >= BC) {
+            break;
+          }
+#endif
+#else
+#if (WARP_PER_BLOCK * 32 * 8 > BC * STRIDE)
+        if (threadIdx.y * 32 + threadIdx.x < (BC * STRIDE / 8)) {
+#else
+        {
+#endif
+          int col = (((threadIdx.y * 32 + threadIdx.x) * 8) & (STRIDE - 1));
+          int row = ((threadIdx.y * 32 + threadIdx.x) * 8) / STRIDE;
+#endif
+          if (aligned_block ||
+              tilecol + row < seq_len && (k + 1) * STRIDE + col < head_dim) {
+            __pipeline_memcpy_async(
+                (void*)(smem.s_bc_st[cache_id] + row * (STRIDE + 8) + col),
+                (void*)(V + (tilecol + row) * head_dim + (k + 1) * STRIDE +
+                        col),
+                16);
+          } else {
+            __pipeline_memcpy_async(
+                (void*)(smem.s_bc_st[cache_id] + row * (STRIDE + 8) + col),
+                nullptr, 16, 16);
           }
         }
       }
+      __pipeline_commit();
+      cache_id ^= 1;
+      __pipeline_wait_prior(1);
       __syncthreads();
+      cutlass::Array<ElementC, WarpMmaQKS::FragmentC::kElements> frag_s16;
+      cutlass::NumericArrayConverter<ElementC, ElementAccum,
+                                     WarpMmaQKS::FragmentC::kElements>
+          convert;
+      frag_s16 = convert(frag_s);
+
       CUTLASS_PRAGMA_UNROLL
       for (int kk = 0; kk < BC; kk += OperatorShape::kK) {
-        WarpMmaSVO::IteratorA::TensorRef ref_s(s_br_bc[warprow] + kk,
-                                               LayoutA((BC + 8)));
-        WarpMmaSVO::IteratorA iter_s(ref_s, threadIdx.x);
-        WarpMmaSVO::IteratorB::TensorRef ref_v(s_bc_st + kk, LayoutB((BC + 8)));
-        WarpMmaSVO::IteratorB iter_v(ref_v, threadIdx.x);
-        WarpMmaSVO::FragmentA frag_s;
+        // WarpMmaSVO::FragmentA frag_s;
         WarpMmaSVO::FragmentB frag_v;
-        iter_s.load(frag_s);
-        iter_v.load(frag_v);
-        mma_svo(frag_o[k], frag_s, frag_v, frag_o[k]);
+        // constexpr int frag_sstride =
+        //     (OperatorShape::kM * OperatorShape::kK / 32 / 2);
+        // CUTLASS_PRAGMA_UNROLL
+        // for (int t = 0; t * OperatorShape::kM < ROW_PER_WARP; ++t) {
+        //   __ldsm<cutlass::layout::RowMajor, frag_sstride>(
+        //       *(reinterpret_cast<cutlass::Array<unsigned, frag_sstride>*>(
+        //             &frag_s) +
+        //         t),
+        //       smem.s_br_bc[warprow + t * OperatorShape::kM] + kk, BC + 8,
+        //       threadIdx.x);
+        // }
+        constexpr int frag_vstride =
+            (OperatorShape::kN * OperatorShape::kK / 32 / 2);
+        CUTLASS_PRAGMA_UNROLL
+        for (int t = 0; t * OperatorShape::kN < STRIDE; ++t) {
+          __ldsm<cutlass::layout::ColumnMajor, frag_vstride>(
+              *(reinterpret_cast<cutlass::Array<unsigned, frag_vstride>*>(
+                    &frag_v) +
+                t),
+              smem.s_bc_st[cache_id] + kk * (STRIDE + 8) +
+                  t * OperatorShape::kN,
+              STRIDE + 8, threadIdx.x);
+        }
+        // mma_svo(frag_o[k], frag_s, frag_v, frag_o[k]);
+        mma_svo(frag_o[k],
+                *(reinterpret_cast<WarpMmaSVO::FragmentA*>(&frag_s16) +
+                  kk / OperatorShape::kK),
+                frag_v, frag_o[k]);
       }
       __syncthreads();
     }
@@ -352,7 +506,7 @@ __global__ void __launch_bounds__(WARP_PER_BLOCK * 32)
       cutlass::Array<ElementC, WarpMmaSVO::FragmentC::kElements> frag_o16;
       frag_o16 = convert(frag_o[k]);
       FragIterSVO frag_iter(frag_o16);
-      TileIterSVO::TensorRef ref_o(s_br_d[warprow] + k * STRIDE,
+      TileIterSVO::TensorRef ref_o(smem.s_br_d[warprow] + k * STRIDE,
                                    LayoutC((max_head_dim + 8)));
       TileIterSVO tile_iter(ref_o, threadIdx.x);
       CUTLASS_PRAGMA_UNROLL
@@ -369,13 +523,11 @@ __global__ void __launch_bounds__(WARP_PER_BLOCK * 32)
          offset += 32 * 8) {
       int col = ((offset + threadIdx.x * 8) & (max_head_dim - 1));
       int row = (offset + threadIdx.x * 8) / max_head_dim + warprow;
-      if (tilerow + row < seq_len && col < head_dim) {
-        __pipeline_memcpy_async((void*)(O + (tilerow + row) * head_dim + col),
-                                (void*)(s_br_d[row] + col), 16);
+      if (aligned_block || tilerow + row < seq_len && col < head_dim) {
+        *(float4*)(O + (tilerow + row) * head_dim + col) =
+            *(float4*)(smem.s_br_d[row] + col);
       }
     }
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
   }
 }
 
@@ -394,22 +546,86 @@ torch::Tensor flash_attention_tensor_op_forward(const torch::Tensor& Q,
   int seq_len = Q.size(2);
   int head_dim = Q.size(3);
 
+  bool aligned_block = (head_dim % 8 == 0 &&
+                        reinterpret_cast<long long>(Q.data_ptr()) % 16 == 0 &&
+                        reinterpret_cast<long long>(K.data_ptr()) % 16 == 0 &&
+                        reinterpret_cast<long long>(V.data_ptr()) % 16 == 0 &&
+                        seq_len % BR == 0 && seq_len % BC == 0 &&
+                        head_dim % STRIDE == 0 && head_dim % 64 == 0);
+  constexpr bool is_causal = true;
+
   auto O = torch::empty({batch, heads, seq_len, head_dim}, Q.options());
 
   dim3 block(32, WARP_PER_BLOCK);
   dim3 grid(1, (seq_len + BR - 1) / BR, batch * heads);
-  if (head_dim <= 64) {
-    flash_attention_kernel<4><<<grid, block>>>(
-        static_cast<cutlass::half_t*>(Q.data_ptr()),
-        static_cast<cutlass::half_t*>(K.data_ptr()),
-        static_cast<cutlass::half_t*>(V.data_ptr()),
-        static_cast<cutlass::half_t*>(O.data_ptr()), seq_len, head_dim, true);
+  if (aligned_block) {
+    if (head_dim <= STRIDE * 2) {
+      int smem_size = sizeof(Smem<STRIDE * 2>);
+      cudaFuncSetAttribute(flash_attention_kernel<true, 2, is_causal>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem_size);
+      flash_attention_kernel<true, 2, is_causal><<<grid, block, smem_size>>>(
+          static_cast<cutlass::half_t*>(Q.data_ptr()),
+          static_cast<cutlass::half_t*>(K.data_ptr()),
+          static_cast<cutlass::half_t*>(V.data_ptr()),
+          static_cast<cutlass::half_t*>(O.data_ptr()), seq_len, head_dim);
+    } else if (head_dim <= STRIDE * 4) {
+      int smem_size = sizeof(Smem<STRIDE * 4>);
+      cudaFuncSetAttribute(flash_attention_kernel<true, 4, is_causal>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem_size);
+      flash_attention_kernel<true, 4, is_causal><<<grid, block, smem_size>>>(
+          static_cast<cutlass::half_t*>(Q.data_ptr()),
+          static_cast<cutlass::half_t*>(K.data_ptr()),
+          static_cast<cutlass::half_t*>(V.data_ptr()),
+          static_cast<cutlass::half_t*>(O.data_ptr()), seq_len, head_dim);
+#if (STRIDE * 8 <= 128)
+    } else {
+      int smem_size = sizeof(Smem<STRIDE * 8>);
+      cudaFuncSetAttribute(flash_attention_kernel<true, 8, is_causal>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem_size);
+      flash_attention_kernel<true, 8, is_causal><<<grid, block, smem_size>>>(
+          static_cast<cutlass::half_t*>(Q.data_ptr()),
+          static_cast<cutlass::half_t*>(K.data_ptr()),
+          static_cast<cutlass::half_t*>(V.data_ptr()),
+          static_cast<cutlass::half_t*>(O.data_ptr()), seq_len, head_dim);
+#endif
+    }
   } else {
-    flash_attention_kernel<8><<<grid, block>>>(
-        static_cast<cutlass::half_t*>(Q.data_ptr()),
-        static_cast<cutlass::half_t*>(K.data_ptr()),
-        static_cast<cutlass::half_t*>(V.data_ptr()),
-        static_cast<cutlass::half_t*>(O.data_ptr()), seq_len, head_dim, true);
+    if (head_dim <= STRIDE * 2) {
+      int smem_size = sizeof(Smem<STRIDE * 2>);
+      cudaFuncSetAttribute(flash_attention_kernel<false, 2, is_causal>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem_size);
+      flash_attention_kernel<false, 2, is_causal><<<grid, block, smem_size>>>(
+          static_cast<cutlass::half_t*>(Q.data_ptr()),
+          static_cast<cutlass::half_t*>(K.data_ptr()),
+          static_cast<cutlass::half_t*>(V.data_ptr()),
+          static_cast<cutlass::half_t*>(O.data_ptr()), seq_len, head_dim);
+    } else if (head_dim <= STRIDE * 4) {
+      int smem_size = sizeof(Smem<STRIDE * 4>);
+      cudaFuncSetAttribute(flash_attention_kernel<false, 4, is_causal>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem_size);
+      flash_attention_kernel<false, 4, is_causal><<<grid, block, smem_size>>>(
+          static_cast<cutlass::half_t*>(Q.data_ptr()),
+          static_cast<cutlass::half_t*>(K.data_ptr()),
+          static_cast<cutlass::half_t*>(V.data_ptr()),
+          static_cast<cutlass::half_t*>(O.data_ptr()), seq_len, head_dim);
+#if (STRIDE * 8 <= 128)
+    } else {
+      int smem_size = sizeof(Smem<STRIDE * 8>);
+      cudaFuncSetAttribute(flash_attention_kernel<false, 8, is_causal>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           smem_size);
+      flash_attention_kernel<false, 8, is_causal><<<grid, block, smem_size>>>(
+          static_cast<cutlass::half_t*>(Q.data_ptr()),
+          static_cast<cutlass::half_t*>(K.data_ptr()),
+          static_cast<cutlass::half_t*>(V.data_ptr()),
+          static_cast<cutlass::half_t*>(O.data_ptr()), seq_len, head_dim);
+#endif
+    }
   }
 
   return O;

@@ -19,9 +19,9 @@ def naive_attention(Q, K, V, scale=None):
 
     score = torch.matmul(Q, K.transpose(-2, -1)) * scale
 
-    attention = F.softmax(score, dim=-1)
+    score = F.softmax(score, dim=-1)
 
-    out = torch.matmul(attention, V)
+    out = torch.matmul(score, V)
     return out
 
 def custom_native_attention(Q, K, V):
@@ -79,6 +79,13 @@ def run_correctness_check(batch=2, heads=4, seq_len=512, head_dim=128, device="c
     elif Q.dtype == torch.float32:
         out = custom_simt_attention(Q, K, V)
 
+    torch.set_printoptions(profile="full", linewidth=120)
+    # print(out[0][0][0:64,0:8])
+    # print((Q[0][0]@K[0][0].T)[0:64,0:8])
+    # print(V[0][0][0:16,0:8])
+    # print(ref[0][0][0:64,0:8])
+    # print((ref - out)[0][0][0:64,0:8])
+    # print(out.shape)
     max_diff = (ref - out).abs().max().item() * (ref.abs().max().item() * out.abs().max().item() + 1e-6)**-0.5
     print(f"[correctness] custom vs sdpa: max_diff = {max_diff:.2e}")
     assert max_diff < 1e-3, f"correctness check failed: {max_diff}"
@@ -164,7 +171,7 @@ def run_benchmark(batch=4, heads=4, seq_len = 512, head_dim=128, warmup=100, ite
     Q_p = Q.as_strided((b, s, h, d), (h*s*d, d, s*d, 1))
     K_p = K.as_strided((b, s, h, d), (h*s*d, d, s*d, 1))
     V_p = V.as_strided((b, s, h, d), (h*s*d, d, s*d, 1))
-    for _ in range(10):
+    for _ in range(warmup):
         xformers_attention(Q_p, K_p, V_p)
     torch.cuda.synchronize()
 
@@ -183,7 +190,7 @@ def benchmark(warmup=100, iters=100, device="cuda", dtype = torch.half):
     print(f"| seq_len | head_dim | custom native | custom simt | custom tensor | sdpa math | sdpa mem efficient | xformers |")
     token_size = 8192
     dim = 256
-    for seq_len in [256, 512, 1024, 2048, 4096, 8192]:
+    for seq_len in [2048, 4096, 8192]:
         if seq_len > token_size:
             break
         for head_dim in [64, 128]:
@@ -223,5 +230,5 @@ if __name__ == "__main__":
     dtype = torch.float16
     print(f"dtype: {dtype}\n")
     run_correctness_check(device=device, dtype = dtype)
-    benchmark(device=device, dtype = dtype)
+    # benchmark(device=device, dtype = dtype)
     # memory_check(device=device, dtype = dtype)

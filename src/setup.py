@@ -8,13 +8,13 @@ from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 if sys.platform == "win32":
     cutlass_path = "D:/Project/cutlass/include"
     extra_compile_args = {
-        "nvcc": ["-O3", "-lineinfo"],
+        "nvcc": ["-O3", "-lineinfo", "--expt-relaxed-constexpr", "--expt-extended-lambda", "--resource-usage"],
         "cxx": ["/O2"],
     }
 else:
-    cutlass_path = "/mnt/d/Project/cutlass/include"
+    cutlass_path = os.path.expanduser("/mnt/d/Project/cutlass/include")
     extra_compile_args = {
-        "nvcc": ["-O3", "-lineinfo"],
+        "nvcc": ["-O3", "-lineinfo", "--expt-relaxed-constexpr", "--expt-extended-lambda", "--resource-usage"],
         "cxx": ["-O3"],
     }
 
